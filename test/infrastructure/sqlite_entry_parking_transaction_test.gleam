@@ -198,6 +198,46 @@ pub fn entry_rolls_back_session_when_ticket_insert_fails_test() {
   close_database(db)
 }
 
+pub fn entry_rolls_back_when_session_insert_fails_test() {
+  let db = setup_database()
+
+  // Seed a session with the same ID as the incoming request.
+  // The transaction should fail when inserting the new session.
+  execute(
+    db,
+    "
+    INSERT INTO parking_sessions
+      (id, vehicle_id, slot_id, entry_time, exit_time, state)
+    VALUES
+      ('SESSION-DUPLICATE', 'VEHICLE-001', 'SLOT-001', 100, 200, 'Completed');
+    ",
+  )
+
+  let transaction = sqlite_entry_parking_transaction.new(db)
+
+  let request = make_request("SESSION-DUPLICATE", "TICKET-NEW", "VEHICLE-001")
+
+  let result = sqlite_entry_parking_transaction.enter(transaction, request)
+
+  case result {
+    Error(entry_parking_transaction.RepositoryFailed(repository_error.StorageError(
+      _,
+    ))) -> Nil
+    Error(_) -> should.fail()
+    Ok(_) -> should.fail()
+  }
+
+  // The pre-existing session must remain the only session.
+  count_rows(db, "parking_sessions")
+  |> should.equal(1)
+
+  // No ticket should be inserted.
+  count_rows(db, "parking_tickets")
+  |> should.equal(0)
+
+  close_database(db)
+}
+
 // MARK: Connection Remains Usable
 
 pub fn connection_remains_usable_after_rollback_test() {
@@ -236,6 +276,59 @@ pub fn connection_remains_usable_after_rollback_test() {
 
   count_rows(db, "parking_tickets")
   |> should.equal(2)
+
+  close_database(db)
+}
+
+pub fn entry_fails_when_floor_repository_fails_test() {
+  let db = setup_database()
+
+  // Rename the original table so the repository query cannot find it.
+  execute(db, "ALTER TABLE parking_floors RENAME TO parking_floors_backup;")
+
+  let transaction = sqlite_entry_parking_transaction.new(db)
+  let request = make_request("SESSION-001", "TICKET-001", "VEHICLE-001")
+
+  let result = sqlite_entry_parking_transaction.enter(transaction, request)
+
+  case result {
+    Error(entry_parking_transaction.RepositoryFailed(repository_error.StorageError(
+      _,
+    ))) -> Nil
+    Error(_) -> should.fail()
+    Ok(_) -> should.fail()
+  }
+
+  count_rows(db, "parking_sessions")
+  |> should.equal(0)
+
+  count_rows(db, "parking_tickets")
+  |> should.equal(0)
+
+  close_database(db)
+}
+
+pub fn entry_fails_when_session_repository_fails_test() {
+  let db = setup_database()
+
+  // Rename the table so the session repository query fails.
+  execute(db, "ALTER TABLE parking_sessions RENAME TO parking_sessions_backup;")
+
+  let transaction = sqlite_entry_parking_transaction.new(db)
+  let request = make_request("SESSION-001", "TICKET-001", "VEHICLE-001")
+
+  let result = sqlite_entry_parking_transaction.enter(transaction, request)
+
+  case result {
+    Error(entry_parking_transaction.RepositoryFailed(repository_error.StorageError(
+      _,
+    ))) -> Nil
+    Error(_) -> should.fail()
+    Ok(_) -> should.fail()
+  }
+
+  count_rows(db, "parking_tickets")
+  |> should.equal(0)
 
   close_database(db)
 }

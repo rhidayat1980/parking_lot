@@ -1,16 +1,3 @@
-// import application/ports/repository_error
-// import domain/parking_session
-// import domain/parking_ticket
-
-// // MARK: Entry Parking Transaction
-
-// pub type EntryParkingTransaction {
-//   EntryParkingTransaction(
-//     save_entry: fn(parking_session.ParkingSession, parking_ticket.ParkingTicket) ->
-//       Result(Nil, repository_error.RepositoryError),
-//   )
-// }
-
 import application/entry_parking
 import application/ports/repository_error
 
