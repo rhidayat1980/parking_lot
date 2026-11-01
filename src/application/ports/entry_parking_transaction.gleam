@@ -15,4 +15,8 @@ pub type EntryParkingTransaction {
 pub type EntryParkingTransactionError {
   RepositoryFailed(repository_error.RepositoryError)
   EntryFailed(entry_parking.EntryParkingError)
+  RollbackFailed(
+    operation_error: EntryParkingTransactionError,
+    rollback_error: repository_error.RepositoryError,
+  )
 }

@@ -5,6 +5,7 @@ import domain/parking_slot
 import domain/vehicle
 import gleam/dynamic/decode
 import gleam/list
+import gleam/option
 import gleam/result
 import sqlight
 
@@ -19,9 +20,10 @@ pub fn new(db: sqlight.Connection) -> SqliteSessionRepository {
 pub fn to_port(
   repository: SqliteSessionRepository,
 ) -> parking_session_repository.ParkingSessionRepository {
-  parking_session_repository.ParkingSessionRepository(get_active_sessions: fn() {
-    get_active_sessions(repository)
-  })
+  parking_session_repository.ParkingSessionRepository(
+    get_active_sessions: fn() { get_active_sessions(repository) },
+    get_session: fn(id) { get_session(repository, id) },
+  )
 }
 
 // -----------------------------------------------------------------------------
@@ -39,6 +41,32 @@ pub fn get_active_sessions(
   use session_data <- result.try(load_active_sessions(db))
 
   build_sessions(session_data)
+}
+
+pub fn get_session(
+  repository: SqliteSessionRepository,
+  id: parking_session.ParkingSessionId,
+) -> Result(
+  option.Option(parking_session.ParkingSession),
+  repository_error.RepositoryError,
+) {
+  let SqliteSessionRepository(db: db) = repository
+
+  use session_data <- result.try(load_active_session(db, id))
+
+  case session_data {
+    [] -> Ok(option.None)
+
+    [data] -> {
+      use session <- result.try(build_session_from_data(data))
+      Ok(option.Some(session))
+    }
+
+    [_, _, ..] ->
+      Error(repository_error.StorageError(
+        "Multiple parking sessions found for one session ID",
+      ))
+  }
 }
 
 // -----------------------------------------------------------------------------
@@ -64,6 +92,31 @@ fn load_active_sessions(
     ",
     on: db,
     with: [],
+    expecting: session_decoder(),
+  ))
+}
+
+fn load_active_session(
+  db: sqlight.Connection,
+  id: parking_session.ParkingSessionId,
+) -> Result(
+  List(#(String, String, String, Int)),
+  repository_error.RepositoryError,
+) {
+  query(sqlight.query(
+    "
+    SELECT
+      id,
+      vehicle_id,
+      slot_id,
+      entry_time
+    FROM parking_sessions
+    WHERE id = ? AND state = 'Active';
+    ",
+    on: db,
+    with: [
+      sqlight.text(parking_session.get_parking_session_id_value(id)),
+    ],
     expecting: session_decoder(),
   ))
 }
@@ -96,18 +149,18 @@ fn build_sessions(
 ) {
   list.fold(session_data, Ok([]), fn(acc, data) {
     use sessions <- result.try(acc)
-
-    let #(session_id, vehicle_id, slot_id, entry_time) = data
-
-    use session <- result.try(build_session(
-      session_id,
-      vehicle_id,
-      slot_id,
-      entry_time,
-    ))
+    use session <- result.try(build_session_from_data(data))
 
     Ok(list.append(sessions, [session]))
   })
+}
+
+fn build_session_from_data(
+  data: #(String, String, String, Int),
+) -> Result(parking_session.ParkingSession, repository_error.RepositoryError) {
+  let #(session_id, vehicle_id, slot_id, entry_time) = data
+
+  build_session(session_id, vehicle_id, slot_id, entry_time)
 }
 
 fn build_session(
@@ -118,21 +171,18 @@ fn build_session(
 ) -> Result(parking_session.ParkingSession, repository_error.RepositoryError) {
   use id <- result.try(case parking_session.new_parking_session_id(session_id) {
     Ok(value) -> Ok(value)
-
     Error(error) ->
       Error(repository_error.StorageError(parking_session.error_message(error)))
   })
 
   use vehicle_id <- result.try(case vehicle.new_vehicle_id(vehicle_id) {
     Ok(value) -> Ok(value)
-
     Error(error) ->
       Error(repository_error.StorageError(vehicle.error_message(error)))
   })
 
   use slot_id <- result.try(case parking_slot.new_parking_slot_id(slot_id) {
     Ok(value) -> Ok(value)
-
     Error(error) ->
       Error(repository_error.StorageError(parking_slot.error_message(error)))
   })
@@ -141,7 +191,6 @@ fn build_session(
     parking_session.new_parking_session(id, vehicle_id, slot_id, entry_time)
   {
     Ok(session) -> Ok(session)
-
     Error(error) ->
       Error(repository_error.StorageError(parking_session.error_message(error)))
   }

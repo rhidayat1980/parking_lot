@@ -44,25 +44,65 @@ pub fn enter(
 ) {
   let SqliteEntryParkingTransaction(db: db) = repository
 
-  case begin_transaction(db) {
-    Error(error) -> Error(entry_parking_transaction.RepositoryFailed(error))
-    Ok(Nil) ->
-      case enter_in_transaction(db, request) {
-        Error(error) -> {
-          rollback(db)
-          Error(error)
-        }
-        Ok(entry_result) ->
-          case commit_transaction(db) {
-            Ok(Nil) -> Ok(entry_result)
-            Error(error) ->
-              Error(entry_parking_transaction.RepositoryFailed(error))
-          }
-      }
+  with_transaction(db, fn() { enter_in_transaction(db, request) })
+}
+
+// MARK: Transaction Lifecycle
+
+fn with_transaction(
+  db: sqlight.Connection,
+  operation: fn() ->
+    Result(a, entry_parking_transaction.EntryParkingTransactionError),
+) -> Result(a, entry_parking_transaction.EntryParkingTransactionError) {
+  use _ <- result.try(
+    begin_transaction(db)
+    |> result.map_error(entry_parking_transaction.RepositoryFailed),
+  )
+
+  finish_transaction(db, operation())
+}
+
+fn finish_transaction(
+  db: sqlight.Connection,
+  operation: Result(a, entry_parking_transaction.EntryParkingTransactionError),
+) -> Result(a, entry_parking_transaction.EntryParkingTransactionError) {
+  case operation {
+    Ok(value) -> commit_or_rollback(db, value)
+    Error(operation_error) -> rollback_after_failure(db, operation_error)
   }
 }
 
-// MARK: Entry Operation Inside Transaction
+fn rollback_after_failure(
+  db: sqlight.Connection,
+  operation_error: entry_parking_transaction.EntryParkingTransactionError,
+) -> Result(a, entry_parking_transaction.EntryParkingTransactionError) {
+  case rollback_transaction(db) {
+    Ok(Nil) -> Error(operation_error)
+
+    Error(rollback_error) ->
+      Error(entry_parking_transaction.RollbackFailed(
+        operation_error: operation_error,
+        rollback_error: rollback_error,
+      ))
+  }
+}
+
+fn commit_or_rollback(
+  db: sqlight.Connection,
+  value: a,
+) -> Result(a, entry_parking_transaction.EntryParkingTransactionError) {
+  case commit_transaction(db) {
+    Ok(Nil) -> Ok(value)
+
+    Error(commit_error) ->
+      rollback_after_failure(
+        db,
+        entry_parking_transaction.RepositoryFailed(commit_error),
+      )
+  }
+}
+
+// MARK: Entry Operation
 
 fn enter_in_transaction(
   db: sqlight.Connection,
@@ -71,68 +111,145 @@ fn enter_in_transaction(
   entry_parking.EntryParkingResult,
   entry_parking_transaction.EntryParkingTransactionError,
 ) {
+  let entry_parking.EntryParkingRequest(vehicle: candidate_vehicle, ..) =
+    request
+
+  use _ <- result.try(
+    persist_vehicle(db, candidate_vehicle)
+    |> result.map_error(entry_parking_transaction.RepositoryFailed),
+  )
+
   let floor_repository = sqlite_floor_repository.new(db)
   let session_repository = sqlite_session_repository.new(db)
 
-  case sqlite_floor_repository.get_all_floors(floor_repository) {
-    Error(error) -> Error(entry_parking_transaction.RepositoryFailed(error))
-    Ok(floors) ->
-      case sqlite_session_repository.get_active_sessions(session_repository) {
-        Error(error) -> Error(entry_parking_transaction.RepositoryFailed(error))
-        Ok(active_sessions) ->
-          case entry_parking.enter_parking(floors, active_sessions, request) {
-            Error(error) -> Error(entry_parking_transaction.EntryFailed(error))
-            Ok(entry_result) -> {
-              let entry_parking.EntryParkingResult(
-                session: session,
-                ticket: ticket,
-                ..,
-              ) = entry_result
+  use floors <- result.try(
+    sqlite_floor_repository.get_all_floors(floor_repository)
+    |> result.map_error(entry_parking_transaction.RepositoryFailed),
+  )
 
-              case insert_session(db, session) {
-                Error(error) ->
-                  Error(entry_parking_transaction.RepositoryFailed(error))
-                Ok(Nil) ->
-                  case insert_ticket(db, ticket) {
-                    Error(error) ->
-                      Error(entry_parking_transaction.RepositoryFailed(error))
-                    Ok(Nil) -> Ok(entry_result)
-                  }
-              }
-            }
-          }
-      }
+  use active_sessions <- result.try(
+    sqlite_session_repository.get_active_sessions(session_repository)
+    |> result.map_error(entry_parking_transaction.RepositoryFailed),
+  )
+
+  use entry_result <- result.try(
+    entry_parking.enter_parking(floors, active_sessions, request)
+    |> result.map_error(entry_parking_transaction.EntryFailed),
+  )
+
+  use _ <- result.try(
+    persist_session(db, entry_result.session)
+    |> result.map_error(entry_parking_transaction.RepositoryFailed),
+  )
+
+  use _ <- result.try(
+    persist_ticket(db, entry_result.ticket)
+    |> result.map_error(entry_parking_transaction.RepositoryFailed),
+  )
+
+  Ok(entry_result)
+}
+
+// MARK: Vehicle Persistence
+
+fn persist_vehicle(
+  db: sqlight.Connection,
+  candidate: vehicle.Vehicle,
+) -> Result(Nil, repository_error.RepositoryError) {
+  let vehicle_id =
+    candidate
+    |> vehicle.get_vehicle_id
+    |> vehicle.get_vehicle_id_value
+
+  let plate_number =
+    candidate
+    |> vehicle.get_vehicle_plate_number
+    |> vehicle.get_plate_number_value
+
+  let vehicle_type =
+    candidate
+    |> vehicle.get_vehicle_type
+    |> vehicle_type_to_string
+
+  use _ <- result.try(insert_vehicle_if_missing(
+    db,
+    vehicle_id,
+    plate_number,
+    vehicle_type,
+  ))
+
+  verify_vehicle_identity(db, vehicle_id, plate_number, vehicle_type)
+}
+
+fn insert_vehicle_if_missing(
+  db: sqlight.Connection,
+  vehicle_id: String,
+  plate_number: String,
+  vehicle_type: String,
+) -> Result(Nil, repository_error.RepositoryError) {
+  query_result(sqlight.query(
+    "
+    INSERT INTO vehicles (id, plate_number, vehicle_type)
+    VALUES (?, ?, ?)
+    ON CONFLICT(id) DO NOTHING;
+    ",
+    on: db,
+    with: [
+      sqlight.text(vehicle_id),
+      sqlight.text(plate_number),
+      sqlight.text(vehicle_type),
+    ],
+    expecting: decode.string,
+  ))
+  |> result.map(fn(_) { Nil })
+}
+
+fn verify_vehicle_identity(
+  db: sqlight.Connection,
+  vehicle_id: String,
+  plate_number: String,
+  vehicle_type: String,
+) -> Result(Nil, repository_error.RepositoryError) {
+  case
+    query_result(sqlight.query(
+      "
+    SELECT COUNT(*)
+    FROM vehicles
+    WHERE id = ?
+      AND plate_number = ?
+      AND vehicle_type = ?;
+    ",
+      on: db,
+      with: [
+        sqlight.text(vehicle_id),
+        sqlight.text(plate_number),
+        sqlight.text(vehicle_type),
+      ],
+      expecting: decode.field(0, decode.int, fn(value) { decode.success(value) }),
+    ))
+  {
+    Ok([1]) -> Ok(Nil)
+
+    Ok(_) ->
+      Error(repository_error.StorageError(
+        "Vehicle ID already exists with different vehicle data",
+      ))
+
+    Error(error) -> Error(error)
   }
 }
 
-// MARK: Transaction
-
-fn begin_transaction(
-  db: sqlight.Connection,
-) -> Result(Nil, repository_error.RepositoryError) {
-  query_result(sqlight.exec("BEGIN IMMEDIATE;", on: db))
-}
-
-fn commit_transaction(
-  db: sqlight.Connection,
-) -> Result(Nil, repository_error.RepositoryError) {
-  case query_result(sqlight.exec("COMMIT;", on: db)) {
-    Ok(Nil) -> Ok(Nil)
-    Error(error) -> {
-      rollback(db)
-      Error(error)
-    }
+fn vehicle_type_to_string(vehicle_type: vehicle.VehicleType) -> String {
+  case vehicle_type {
+    vehicle.Motorcycle -> "Motorcycle"
+    vehicle.Car -> "Car"
+    vehicle.Truck -> "Truck"
   }
 }
 
-fn rollback(db: sqlight.Connection) {
-  let _ = sqlight.exec("ROLLBACK;", on: db)
-  Nil
-}
+// MARK: Session Persistence
 
-// MARK: Insert Session
-
-fn insert_session(
+fn persist_session(
   db: sqlight.Connection,
   session: parking_session.ParkingSession,
 ) -> Result(Nil, repository_error.RepositoryError) {
@@ -171,9 +288,9 @@ fn insert_session(
   |> result.map(fn(_) { Nil })
 }
 
-// MARK: Insert Ticket
+// MARK: Ticket Persistence
 
-fn insert_ticket(
+fn persist_ticket(
   db: sqlight.Connection,
   ticket: parking_ticket.ParkingTicket,
 ) -> Result(Nil, repository_error.RepositoryError) {
@@ -205,13 +322,34 @@ fn insert_ticket(
   |> result.map(fn(_) { Nil })
 }
 
-// MARK: Error Mapping
+// MARK: Transaction Commands
+
+fn begin_transaction(
+  db: sqlight.Connection,
+) -> Result(Nil, repository_error.RepositoryError) {
+  query_result(sqlight.exec("BEGIN IMMEDIATE;", on: db))
+}
+
+fn commit_transaction(
+  db: sqlight.Connection,
+) -> Result(Nil, repository_error.RepositoryError) {
+  query_result(sqlight.exec("COMMIT;", on: db))
+}
+
+fn rollback_transaction(
+  db: sqlight.Connection,
+) -> Result(Nil, repository_error.RepositoryError) {
+  query_result(sqlight.exec("ROLLBACK;", on: db))
+}
+
+// MARK: SQL Error Mapping
 
 fn query_result(
   value: Result(a, sqlight.Error),
 ) -> Result(a, repository_error.RepositoryError) {
   case value {
     Ok(value) -> Ok(value)
+
     Error(sqlight.SqlightError(_, message, _)) ->
       Error(repository_error.StorageError(message))
   }

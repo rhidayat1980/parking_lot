@@ -1,26 +1,47 @@
-import domain/vehicle
+import application/ports/repository_error
+import application/seed_parking_layout
+import domain/floor
+import domain/parking_slot
 import gleam/io
+import infrastructure/sqlite_database
+import infrastructure/sqlite_floor_repository
 
 pub fn main() -> Nil {
-  case register_example_vehicle() {
-    Ok(_) -> io.println("Vehicle created successfully")
-    Error(error) -> io.println(vehicle.error_message(error))
+  case sqlite_database.connect() {
+    Ok(db) -> {
+      let floor_repository =
+        sqlite_floor_repository.new(db)
+        |> sqlite_floor_repository.to_port
+
+      case seed_parking_layout.seed(floor_repository) {
+        Ok(Nil) -> io.println("Parking layout seeded successfully")
+
+        Error(error) ->
+          io.println(
+            "Parking layout seeding failed: " <> seed_error_message(error),
+          )
+      }
+    }
+
+    Error(repository_error.StorageError(message)) ->
+      io.println("Database initialization failed: " <> message)
   }
 }
 
-pub fn register_example_vehicle() -> Result(
-  vehicle.Vehicle,
-  vehicle.VehicleError,
-) {
-  case vehicle.new_vehicle_id("V001") {
-    Error(error) -> Error(error)
-    Ok(id) -> {
-      case vehicle.new_plate_number("B 1234 ABC") {
-        Error(error) -> Error(error)
-        Ok(plate) -> {
-          Ok(vehicle.new_vehicle(id, plate, vehicle.Car))
-        }
-      }
-    }
+fn seed_error_message(
+  error: seed_parking_layout.SeedParkingLayoutError,
+) -> String {
+  case error {
+    seed_parking_layout.InvalidFloorId(domain_error) ->
+      "Invalid floor ID: " <> floor.error_message(domain_error)
+
+    seed_parking_layout.InvalidSlotId(domain_error) ->
+      "Invalid slot ID: " <> parking_slot.error_message(domain_error)
+
+    seed_parking_layout.FloorConfigurationFailed(domain_error) ->
+      "Floor configuration failed: " <> floor.error_message(domain_error)
+
+    seed_parking_layout.RepositoryFailed(repository_error.StorageError(message)) ->
+      "Repository failed: " <> message
   }
 }
