@@ -52,7 +52,7 @@ pub fn get_session(
 ) {
   let SqliteSessionRepository(db: db) = repository
 
-  use session_data <- result.try(load_active_session(db, id))
+  use session_data <- result.try(load_session(db, id))
 
   case session_data {
     [] -> Ok(option.None)
@@ -92,15 +92,15 @@ fn load_active_sessions(
     ",
     on: db,
     with: [],
-    expecting: session_decoder(),
+    expecting: active_session_decoder(),
   ))
 }
 
-fn load_active_session(
+fn load_session(
   db: sqlight.Connection,
   id: parking_session.ParkingSessionId,
 ) -> Result(
-  List(#(String, String, String, Int)),
+  List(#(String, String, String, Int, String, Int)),
   repository_error.RepositoryError,
 ) {
   query(sqlight.query(
@@ -109,9 +109,11 @@ fn load_active_session(
       id,
       vehicle_id,
       slot_id,
-      entry_time
+      entry_time,
+      state,
+      COALESCE(exit_time, -1)
     FROM parking_sessions
-    WHERE id = ? AND state = 'Active';
+    WHERE id = ?;
     ",
     on: db,
     with: [
@@ -119,6 +121,22 @@ fn load_active_session(
     ],
     expecting: session_decoder(),
   ))
+}
+
+fn active_session_decoder() {
+  decode.at([0], decode.string)
+  |> decode.then(fn(session_id) {
+    decode.at([1], decode.string)
+    |> decode.then(fn(vehicle_id) {
+      decode.at([2], decode.string)
+      |> decode.then(fn(slot_id) {
+        decode.at([3], decode.int)
+        |> decode.map(fn(entry_time) {
+          #(session_id, vehicle_id, slot_id, entry_time)
+        })
+      })
+    })
+  })
 }
 
 fn session_decoder() {
@@ -129,8 +147,14 @@ fn session_decoder() {
       decode.at([2], decode.string)
       |> decode.then(fn(slot_id) {
         decode.at([3], decode.int)
-        |> decode.map(fn(entry_time) {
-          #(session_id, vehicle_id, slot_id, entry_time)
+        |> decode.then(fn(entry_time) {
+          decode.at([4], decode.string)
+          |> decode.then(fn(state) {
+            decode.at([5], decode.int)
+            |> decode.map(fn(exit_time) {
+              #(session_id, vehicle_id, slot_id, entry_time, state, exit_time)
+            })
+          })
         })
       })
     })
@@ -149,18 +173,50 @@ fn build_sessions(
 ) {
   list.fold(session_data, Ok([]), fn(acc, data) {
     use sessions <- result.try(acc)
-    use session <- result.try(build_session_from_data(data))
+    use session <- result.try(build_active_session_from_data(data))
 
     Ok(list.append(sessions, [session]))
   })
 }
 
-fn build_session_from_data(
+fn build_active_session_from_data(
   data: #(String, String, String, Int),
 ) -> Result(parking_session.ParkingSession, repository_error.RepositoryError) {
   let #(session_id, vehicle_id, slot_id, entry_time) = data
 
   build_session(session_id, vehicle_id, slot_id, entry_time)
+}
+
+fn build_session_from_data(
+  data: #(String, String, String, Int, String, Int),
+) -> Result(parking_session.ParkingSession, repository_error.RepositoryError) {
+  let #(session_id, vehicle_id, slot_id, entry_time, state, exit_time) = data
+
+  use session <- result.try(build_session(
+    session_id,
+    vehicle_id,
+    slot_id,
+    entry_time,
+  ))
+
+  case state {
+    "Active" if exit_time == -1 -> Ok(session)
+
+    "Closed" if exit_time >= 0 ->
+      case parking_session.close_parking_session(session, exit_time) {
+        Ok(closed_session) -> Ok(closed_session)
+
+        Error(error) ->
+          Error(
+            repository_error.StorageError(parking_session.error_message(error)),
+          )
+      }
+
+    _ ->
+      Error(repository_error.StorageError(
+        "Invalid parking session state or exit time in database",
+      ))
+  }
 }
 
 fn build_session(
@@ -191,6 +247,7 @@ fn build_session(
     parking_session.new_parking_session(id, vehicle_id, slot_id, entry_time)
   {
     Ok(session) -> Ok(session)
+
     Error(error) ->
       Error(repository_error.StorageError(parking_session.error_message(error)))
   }

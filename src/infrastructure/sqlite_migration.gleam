@@ -18,8 +18,8 @@ const initial_migration_name = "001_create_parking_schema"
 /// Menjalankan migrasi database.
 ///
 /// Database baru akan dimigrasikan menggunakan Migrant.
-/// Database lama yang sudah memiliki schema lengkap dan
-/// legacy migration history akan diadopsi ke Migrant.
+/// Database lama dengan legacy migration history akan diadopsi
+/// ke Migrant sebelum menjalankan migrasi yang masih pending.
 pub fn migrate(
   db: sqlight.Connection,
   migrations_dir: String,
@@ -32,7 +32,7 @@ pub fn migrate(
   case list.length(existing_domain_tables) {
     0 -> migrate_new_database(db, tables, migrations_dir)
 
-    5 -> migrate_existing_database(db, tables)
+    5 -> migrate_existing_database(db, tables, migrations_dir)
 
     _ ->
       Error(
@@ -59,11 +59,7 @@ fn migrate_new_database(
             "Database memiliki __migrations tetapi tidak memiliki schema domain. Pemeriksaan manual diperlukan.",
           )
 
-        False ->
-          migrant.migrate(db, migrations_dir)
-          |> result.map_error(fn(_) {
-            "Gagal menjalankan migrasi database menggunakan Migrant."
-          })
+        False -> run_pending_migrations(db, migrations_dir)
       }
   }
 }
@@ -71,6 +67,7 @@ fn migrate_new_database(
 fn migrate_existing_database(
   db: sqlight.Connection,
   tables: List(String),
+  migrations_dir: String,
 ) -> Result(Nil, String) {
   case list.contains(tables, "__migrations") {
     True -> {
@@ -82,7 +79,7 @@ fn migrate_existing_database(
       )
 
       case applied {
-        True -> Ok(Nil)
+        True -> run_pending_migrations(db, migrations_dir)
 
         False ->
           Error(
@@ -91,7 +88,11 @@ fn migrate_existing_database(
       }
     }
 
-    False -> adopt_legacy_database(db, tables)
+    False -> {
+      use _ <- result.try(adopt_legacy_database(db, tables))
+
+      run_pending_migrations(db, migrations_dir)
+    }
   }
 }
 
@@ -125,6 +126,17 @@ fn adopt_legacy_database(
   }
 }
 
+/// Menjalankan seluruh migrasi yang belum tercatat oleh Migrant.
+fn run_pending_migrations(
+  db: sqlight.Connection,
+  migrations_dir: String,
+) -> Result(Nil, String) {
+  migrant.migrate(db, migrations_dir)
+  |> result.map_error(fn(_) {
+    "Gagal menjalankan migrasi database menggunakan Migrant."
+  })
+}
+
 fn load_table_names(db: sqlight.Connection) -> Result(List(String), String) {
   sqlight.query(
     "
@@ -145,10 +157,10 @@ fn legacy_migration_is_applied(
 ) -> Result(Bool, sqlight.Error) {
   use versions <- result.try(sqlight.query(
     "
-      SELECT name
-      FROM schema_migrations
-      WHERE version = 1;
-      ",
+    SELECT name
+    FROM schema_migrations
+    WHERE version = 1;
+    ",
     on: db,
     with: [],
     expecting: decode.field(0, decode.string, fn(name) { decode.success(name) }),
@@ -162,10 +174,10 @@ fn migrant_migration_is_applied(
 ) -> Result(Bool, sqlight.Error) {
   use names <- result.try(sqlight.query(
     "
-      SELECT name
-      FROM __migrations
-      WHERE name = ?;
-      ",
+    SELECT name
+    FROM __migrations
+    WHERE name = ?;
+    ",
     on: db,
     with: [sqlight.text(initial_migration_name)],
     expecting: decode.field(0, decode.string, fn(name) { decode.success(name) }),
@@ -185,6 +197,7 @@ fn record_migrant_migration(db: sqlight.Connection) -> Result(Nil, String) {
         Ok(Nil) ->
           case sqlight.exec("COMMIT;", on: db) {
             Ok(Nil) -> Ok(Nil)
+
             Error(_) -> {
               rollback_migration_adoption(db)
               Error("Gagal melakukan commit adopsi migration.")

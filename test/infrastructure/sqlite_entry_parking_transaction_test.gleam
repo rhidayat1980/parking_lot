@@ -2,6 +2,7 @@ import application/entry_parking
 import application/ports/entry_parking_transaction
 import application/ports/repository_error
 import domain/parking_session
+import domain/parking_slot
 import domain/parking_ticket
 import domain/vehicle
 import gleam/dynamic/decode
@@ -13,76 +14,42 @@ import sqlight
 
 // MARK: Test Helpers
 
-fn setup_database() -> sqlight.Connection {
+fn setup_database(with_slot: Bool) -> sqlight.Connection {
   let assert Ok(db) = sqlite_connection.connect_to(":memory:")
 
-  let assert Ok(migration_sql) =
+  let assert Ok(initial_migration) =
     simplifile.read(
       from: "priv/repo/migrations/001_create_parking_schema.up.sql",
     )
 
-  let assert Ok(Nil) = sqlight.exec(migration_sql, on: db)
+  let assert Ok(Nil) = sqlight.exec(initial_migration, on: db)
 
-  let assert Ok(Nil) =
-    sqlight.exec(
-      "
-      INSERT INTO vehicles (id, plate_number, vehicle_type)
-      VALUES ('VEHICLE-001', 'B 1234 ABC', 'Car');
+  case with_slot {
+    True -> {
+      let assert Ok(Nil) =
+        sqlight.exec(
+          "
+          INSERT INTO parking_floors (id)
+          VALUES ('FLOOR-001');
 
-      INSERT INTO parking_floors (id)
-      VALUES ('FLOOR-001');
+          INSERT INTO parking_slots
+            (id, floor_id, supported_vehicle_type)
+          VALUES
+            ('SLOT-001', 'FLOOR-001', 'Car');
+          ",
+          on: db,
+        )
+      Nil
+    }
 
-      INSERT INTO parking_slots (id, floor_id, supported_vehicle_type)
-      VALUES ('SLOT-001', 'FLOOR-001', 'Car');
-      ",
-      on: db,
-    )
+    False -> Nil
+  }
 
   db
 }
 
-fn execute(db: sqlight.Connection, sql: String) -> Nil {
+fn execute(db: sqlight.Connection, sql: String) {
   let assert Ok(Nil) = sqlight.exec(sql, on: db)
-  Nil
-}
-
-fn make_vehicle(id: String) -> vehicle.Vehicle {
-  make_vehicle_with_details(id, "B 1234 ABC", vehicle.Car)
-}
-
-fn make_vehicle_with_details(
-  id: String,
-  plate: String,
-  vehicle_type: vehicle.VehicleType,
-) -> vehicle.Vehicle {
-  let assert Ok(vehicle_id) = vehicle.new_vehicle_id(id)
-  let assert Ok(plate_number) = vehicle.new_plate_number(plate)
-
-  vehicle.new_vehicle(vehicle_id, plate_number, vehicle_type)
-}
-
-fn make_request(
-  session_id: String,
-  ticket_id: String,
-  vehicle_id: String,
-) -> entry_parking.EntryParkingRequest {
-  make_request_with_vehicle(session_id, ticket_id, make_vehicle(vehicle_id))
-}
-
-fn make_request_with_vehicle(
-  session_id: String,
-  ticket_id: String,
-  candidate_vehicle: vehicle.Vehicle,
-) -> entry_parking.EntryParkingRequest {
-  let assert Ok(session) = parking_session.new_parking_session_id(session_id)
-  let assert Ok(ticket) = parking_ticket.new_parking_ticket_id(ticket_id)
-
-  entry_parking.EntryParkingRequest(
-    session_id: session,
-    ticket_id: ticket,
-    vehicle: candidate_vehicle,
-    entry_time: 1000,
-  )
 }
 
 fn count_rows(db: sqlight.Connection, table: String) -> Int {
@@ -97,49 +64,132 @@ fn count_rows(db: sqlight.Connection, table: String) -> Int {
   count
 }
 
-fn close_database(db: sqlight.Connection) -> Nil {
-  let assert Ok(Nil) = sqlight.close(db)
-  Nil
+fn get_session_state(db: sqlight.Connection) -> String {
+  let assert Ok([state]) =
+    sqlight.query(
+      "SELECT state FROM parking_sessions WHERE id = 'SESSION-001';",
+      on: db,
+      with: [],
+      expecting: decode.field(0, decode.string, fn(value) {
+        decode.success(value)
+      }),
+    )
+
+  state
 }
 
-fn make_existing_completed_session(db: sqlight.Connection) -> Nil {
-  execute(
-    db,
-    "
-    INSERT INTO parking_slots (id, floor_id, supported_vehicle_type)
-    VALUES ('SLOT-EXISTING', 'FLOOR-001', 'Car');
+fn make_vehicle(
+  id: String,
+  plate_number: String,
+  vehicle_type: vehicle.VehicleType,
+) -> vehicle.Vehicle {
+  let assert Ok(vehicle_id) = vehicle.new_vehicle_id(id)
+  let assert Ok(plate) = vehicle.new_plate_number(plate_number)
 
-    INSERT INTO parking_sessions
-      (id, vehicle_id, slot_id, entry_time, exit_time, state)
-    VALUES
-      ('SESSION-EXISTING', 'VEHICLE-001', 'SLOT-EXISTING', 100, 200, 'Closed');
+  vehicle.new_vehicle(vehicle_id, plate, vehicle_type)
+}
 
-    INSERT INTO parking_tickets (id, session_id, issued_at)
-    VALUES ('TICKET-DUPLICATE', 'SESSION-EXISTING', 100);
-    ",
+fn make_request(
+  candidate_vehicle: vehicle.Vehicle,
+) -> entry_parking.EntryParkingRequest {
+  let assert Ok(session_id) =
+    parking_session.new_parking_session_id("SESSION-001")
+
+  let assert Ok(ticket_id) = parking_ticket.new_parking_ticket_id("TICKET-001")
+
+  entry_parking.EntryParkingRequest(
+    session_id: session_id,
+    ticket_id: ticket_id,
+    vehicle: candidate_vehicle,
+    entry_time: 1000,
   )
 }
 
-// MARK: Successful Transaction
+fn make_car() -> vehicle.Vehicle {
+  make_vehicle("VEHICLE-001", "B 1234 ABC", vehicle.Car)
+}
 
-pub fn entry_persists_session_and_ticket_test() {
-  let db = setup_database()
+fn close_database(db: sqlight.Connection) {
+  let assert Ok(Nil) = sqlight.close(db)
+}
+
+// MARK: Successful Entry
+
+pub fn successful_entry_persists_vehicle_session_and_ticket_test() {
+  let db = setup_database(True)
   let transaction = sqlite_entry_parking_transaction.new(db)
-
-  let request = make_request("SESSION-001", "TICKET-001", "VEHICLE-001")
+  let request = make_request(make_car())
 
   let result = sqlite_entry_parking_transaction.enter(transaction, request)
 
   case result {
     Ok(entry_result) -> {
-      parking_session.get_parking_session_state(entry_result.session)
-      |> should.equal(parking_session.Active)
+      should.equal(
+        parking_session.get_parking_session_id_value(
+          parking_session.get_parking_session_id(entry_result.session),
+        ),
+        "SESSION-001",
+      )
 
-      parking_ticket.get_parking_ticket_issued_at(entry_result.ticket)
-      |> should.equal(1000)
+      should.equal(
+        parking_ticket.get_parking_ticket_id_value(
+          parking_ticket.get_parking_ticket_id(entry_result.ticket),
+        ),
+        "TICKET-001",
+      )
+
+      should.equal(
+        parking_slot.get_parking_slot_id_value(parking_slot.get_parking_slot_id(
+          entry_result.slot,
+        )),
+        "SLOT-001",
+      )
     }
+
     Error(_) -> should.fail()
   }
+
+  count_rows(db, "vehicles")
+  |> should.equal(1)
+
+  count_rows(db, "parking_sessions")
+  |> should.equal(1)
+
+  count_rows(db, "parking_tickets")
+  |> should.equal(1)
+
+  get_session_state(db)
+  |> should.equal("Active")
+
+  close_database(db)
+}
+
+// MARK: Existing Vehicle
+
+pub fn existing_vehicle_is_not_duplicated_test() {
+  let db = setup_database(True)
+
+  let _ =
+    execute(
+      db,
+      "
+      INSERT INTO vehicles (id, plate_number, vehicle_type)
+      VALUES ('VEHICLE-001', 'B 1234 ABC', 'Car');
+      ",
+    )
+
+  let transaction = sqlite_entry_parking_transaction.new(db)
+  let request = make_request(make_car())
+
+  let result = sqlite_entry_parking_transaction.enter(transaction, request)
+
+  case result {
+    Ok(_) -> Nil
+    Error(_) -> should.fail()
+  }
+
+  count_rows(db, "vehicles")
+  |> should.equal(1)
 
   count_rows(db, "parking_sessions")
   |> should.equal(1)
@@ -150,65 +200,26 @@ pub fn entry_persists_session_and_ticket_test() {
   close_database(db)
 }
 
-// MARK: Vehicle Persistence
+// MARK: Vehicle Identity Conflict
 
-pub fn entry_persists_new_vehicle_test() {
-  let db = setup_database()
-  let transaction = sqlite_entry_parking_transaction.new(db)
+pub fn vehicle_identity_conflict_rejects_entry_test() {
+  let db = setup_database(True)
 
-  let request = make_request("SESSION-NEW", "TICKET-NEW", "VEHICLE-002")
+  let _ =
+    execute(
+      db,
+      "
+      INSERT INTO vehicles (id, plate_number, vehicle_type)
+      VALUES ('VEHICLE-001', 'B 1234 ABC', 'Car');
+      ",
+    )
 
-  let result = sqlite_entry_parking_transaction.enter(transaction, request)
-
-  case result {
-    Ok(_) -> Nil
-    Error(_) -> should.fail()
-  }
-
-  count_rows(db, "vehicles")
-  |> should.equal(2)
-
-  count_rows(db, "parking_sessions")
-  |> should.equal(1)
-
-  count_rows(db, "parking_tickets")
-  |> should.equal(1)
-
-  close_database(db)
-}
-
-pub fn entry_reuses_existing_vehicle_with_same_identity_test() {
-  let db = setup_database()
-  let transaction = sqlite_entry_parking_transaction.new(db)
-
-  let request = make_request("SESSION-001", "TICKET-001", "VEHICLE-001")
-
-  let result = sqlite_entry_parking_transaction.enter(transaction, request)
-
-  case result {
-    Ok(_) -> Nil
-    Error(_) -> should.fail()
-  }
-
-  // Existing vehicle must not be duplicated.
-  count_rows(db, "vehicles")
-  |> should.equal(1)
-
-  count_rows(db, "parking_sessions")
-  |> should.equal(1)
-
-  close_database(db)
-}
-
-pub fn entry_rejects_vehicle_id_with_different_identity_test() {
-  let db = setup_database()
   let transaction = sqlite_entry_parking_transaction.new(db)
 
   let conflicting_vehicle =
-    make_vehicle_with_details("VEHICLE-001", "B 9999 XYZ", vehicle.Car)
+    make_vehicle("VEHICLE-001", "B 9999 XYZ", vehicle.Car)
 
-  let request =
-    make_request_with_vehicle("SESSION-001", "TICKET-001", conflicting_vehicle)
+  let request = make_request(conflicting_vehicle)
 
   let result = sqlite_entry_parking_transaction.enter(transaction, request)
 
@@ -221,11 +232,9 @@ pub fn entry_rejects_vehicle_id_with_different_identity_test() {
     Ok(_) -> should.fail()
   }
 
-  // The original vehicle must remain unchanged.
   count_rows(db, "vehicles")
   |> should.equal(1)
 
-  // No session or ticket should be created.
   count_rows(db, "parking_sessions")
   |> should.equal(0)
 
@@ -235,93 +244,57 @@ pub fn entry_rejects_vehicle_id_with_different_identity_test() {
   close_database(db)
 }
 
-// MARK: Rollback
+// MARK: No Available Slot
 
-pub fn entry_rolls_back_session_when_ticket_insert_fails_test() {
-  let db = setup_database()
-  make_existing_completed_session(db)
-
+pub fn no_available_slot_rolls_back_vehicle_test() {
+  let db = setup_database(False)
   let transaction = sqlite_entry_parking_transaction.new(db)
-
-  // The slot is available, so allocation succeeds.
-  // Inserting the duplicate ticket ID then fails.
-  let request = make_request("SESSION-NEW", "TICKET-DUPLICATE", "VEHICLE-001")
+  let request = make_request(make_car())
 
   let result = sqlite_entry_parking_transaction.enter(transaction, request)
 
   case result {
-    Error(entry_parking_transaction.RepositoryFailed(repository_error.StorageError(
-      _,
-    ))) -> Nil
+    Error(entry_parking_transaction.EntryFailed(
+      entry_parking.NoAvailableParkingSlot,
+    )) -> Nil
 
     Error(_) -> should.fail()
     Ok(_) -> should.fail()
   }
 
-  // Only the pre-existing completed session must remain.
-  count_rows(db, "parking_sessions")
-  |> should.equal(1)
-
-  // Only the pre-existing ticket must remain.
-  count_rows(db, "parking_tickets")
-  |> should.equal(1)
-
-  close_database(db)
-}
-
-pub fn entry_rolls_back_new_vehicle_when_ticket_insert_fails_test() {
-  let db = setup_database()
-  make_existing_completed_session(db)
-
-  let transaction = sqlite_entry_parking_transaction.new(db)
-
-  // VEHICLE-002 does not exist before this transaction.
-  // The duplicate ticket causes the transaction to fail.
-  let request = make_request("SESSION-NEW", "TICKET-DUPLICATE", "VEHICLE-002")
-
-  let result = sqlite_entry_parking_transaction.enter(transaction, request)
-
-  case result {
-    Error(entry_parking_transaction.RepositoryFailed(repository_error.StorageError(
-      _,
-    ))) -> Nil
-
-    Error(_) -> should.fail()
-    Ok(_) -> should.fail()
-  }
-
-  // The newly inserted vehicle must also be rolled back.
+  // Vehicle persistence happens before slot allocation.
+  // The failed use case must roll back that INSERT.
   count_rows(db, "vehicles")
-  |> should.equal(1)
+  |> should.equal(0)
 
-  // Existing records must remain unchanged.
   count_rows(db, "parking_sessions")
-  |> should.equal(1)
+  |> should.equal(0)
 
   count_rows(db, "parking_tickets")
-  |> should.equal(1)
+  |> should.equal(0)
 
   close_database(db)
 }
 
-pub fn entry_rolls_back_when_session_insert_fails_test() {
-  let db = setup_database()
+// MARK: Session Persistence Failure
 
-  // Seed a session with the same ID as the incoming request.
-  // The transaction should fail when inserting the new session.
-  execute(
-    db,
-    "
-    INSERT INTO parking_sessions
-      (id, vehicle_id, slot_id, entry_time, exit_time, state)
-    VALUES
-      ('SESSION-DUPLICATE', 'VEHICLE-001', 'SLOT-001', 100, 200, 'Closed');
-    ",
-  )
+pub fn failed_session_insert_rolls_back_vehicle_test() {
+  let db = setup_database(True)
+
+  let _ =
+    execute(
+      db,
+      "
+      CREATE TRIGGER reject_session_insert
+      BEFORE INSERT ON parking_sessions
+      BEGIN
+        SELECT RAISE(ABORT, 'Simulated session insert failure');
+      END;
+      ",
+    )
 
   let transaction = sqlite_entry_parking_transaction.new(db)
-
-  let request = make_request("SESSION-DUPLICATE", "TICKET-NEW", "VEHICLE-001")
+  let request = make_request(make_car())
 
   let result = sqlite_entry_parking_transaction.enter(transaction, request)
 
@@ -334,70 +307,38 @@ pub fn entry_rolls_back_when_session_insert_fails_test() {
     Ok(_) -> should.fail()
   }
 
-  // The pre-existing session must remain the only session.
-  count_rows(db, "parking_sessions")
-  |> should.equal(1)
+  // Vehicle INSERT must be rolled back.
+  count_rows(db, "vehicles")
+  |> should.equal(0)
 
-  // No ticket should be inserted.
+  count_rows(db, "parking_sessions")
+  |> should.equal(0)
+
   count_rows(db, "parking_tickets")
   |> should.equal(0)
 
   close_database(db)
 }
 
-// MARK: Connection Remains Usable
+// MARK: Ticket Persistence Failure
 
-pub fn connection_remains_usable_after_rollback_test() {
-  let db = setup_database()
-  make_existing_completed_session(db)
+pub fn failed_ticket_insert_rolls_back_vehicle_and_session_test() {
+  let db = setup_database(True)
 
-  let transaction = sqlite_entry_parking_transaction.new(db)
-
-  let failed_request =
-    make_request("SESSION-FAILED", "TICKET-DUPLICATE", "VEHICLE-001")
-
-  let failed_result =
-    sqlite_entry_parking_transaction.enter(transaction, failed_request)
-
-  case failed_result {
-    Error(entry_parking_transaction.RepositoryFailed(repository_error.StorageError(
-      _,
-    ))) -> Nil
-
-    Error(_) -> should.fail()
-    Ok(_) -> should.fail()
-  }
-
-  // A new entry on the same connection should still work after rollback.
-  let next_request = make_request("SESSION-NEXT", "TICKET-NEXT", "VEHICLE-001")
-
-  let next_result =
-    sqlite_entry_parking_transaction.enter(transaction, next_request)
-
-  case next_result {
-    Ok(_) -> Nil
-    Error(_) -> should.fail()
-  }
-
-  count_rows(db, "parking_sessions")
-  |> should.equal(2)
-
-  count_rows(db, "parking_tickets")
-  |> should.equal(2)
-
-  close_database(db)
-}
-
-// MARK: Repository Failures
-
-pub fn entry_fails_when_floor_repository_fails_test() {
-  let db = setup_database()
-
-  // Rename the original table so the repository query cannot find it.
-  execute(db, "ALTER TABLE parking_floors RENAME TO parking_floors_backup;")
+  let _ =
+    execute(
+      db,
+      "
+      CREATE TRIGGER reject_ticket_insert
+      BEFORE INSERT ON parking_tickets
+      BEGIN
+        SELECT RAISE(ABORT, 'Simulated ticket insert failure');
+      END;
+      ",
+    )
 
   let transaction = sqlite_entry_parking_transaction.new(db)
-  let request = make_request("SESSION-001", "TICKET-001", "VEHICLE-001")
+  let request = make_request(make_car())
 
   let result = sqlite_entry_parking_transaction.enter(transaction, request)
 
@@ -410,34 +351,12 @@ pub fn entry_fails_when_floor_repository_fails_test() {
     Ok(_) -> should.fail()
   }
 
+  // Both earlier INSERT operations must be rolled back.
+  count_rows(db, "vehicles")
+  |> should.equal(0)
+
   count_rows(db, "parking_sessions")
   |> should.equal(0)
-
-  count_rows(db, "parking_tickets")
-  |> should.equal(0)
-
-  close_database(db)
-}
-
-pub fn entry_fails_when_session_repository_fails_test() {
-  let db = setup_database()
-
-  // Rename the table so the session repository query fails.
-  execute(db, "ALTER TABLE parking_sessions RENAME TO parking_sessions_backup;")
-
-  let transaction = sqlite_entry_parking_transaction.new(db)
-  let request = make_request("SESSION-001", "TICKET-001", "VEHICLE-001")
-
-  let result = sqlite_entry_parking_transaction.enter(transaction, request)
-
-  case result {
-    Error(entry_parking_transaction.RepositoryFailed(repository_error.StorageError(
-      _,
-    ))) -> Nil
-
-    Error(_) -> should.fail()
-    Ok(_) -> should.fail()
-  }
 
   count_rows(db, "parking_tickets")
   |> should.equal(0)

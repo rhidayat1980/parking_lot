@@ -1,0 +1,7071 @@
+
+
+============================================================
+FILE: src/application/entry_parking.gleam
+============================================================
+import domain/floor
+import domain/parking_allocation
+import domain/parking_session
+import domain/parking_slot
+import domain/parking_ticket
+import domain/vehicle
+import gleam/result
+
+// MARK: Errors
+
+pub type EntryParkingError {
+  NoAvailableParkingSlot
+  AllocationFailed(parking_allocation.ParkingAllocationError)
+}
+
+pub fn error_message(error: EntryParkingError) -> String {
+  case error {
+    NoAvailableParkingSlot -> "No available parking slot for this vehicle"
+
+    AllocationFailed(allocation_error) ->
+      parking_allocation.error_message(allocation_error)
+  }
+}
+
+// MARK: Entry Parking Request
+
+pub type EntryParkingRequest {
+  EntryParkingRequest(
+    session_id: parking_session.ParkingSessionId,
+    ticket_id: parking_ticket.ParkingTicketId,
+    vehicle: vehicle.Vehicle,
+    entry_time: Int,
+  )
+}
+
+// MARK: Entry Parking Result
+
+pub type EntryParkingResult {
+  EntryParkingResult(
+    floor_id: floor.ParkingFloorId,
+    slot: parking_slot.ParkingSlot,
+    session: parking_session.ParkingSession,
+    ticket: parking_ticket.ParkingTicket,
+  )
+}
+
+// MARK: Entry Parking
+
+pub fn enter_parking(
+  floors: List(floor.ParkingFloor),
+  existing_sessions: List(parking_session.ParkingSession),
+  request: EntryParkingRequest,
+) -> Result(EntryParkingResult, EntryParkingError) {
+  let EntryParkingRequest(
+    session_id: session_id,
+    ticket_id: ticket_id,
+    vehicle: candidate_vehicle,
+    entry_time: entry_time,
+  ) = request
+
+  use #(floor_id, slot, session) <- result.try(find_available_slot(
+    floors,
+    existing_sessions,
+    session_id,
+    candidate_vehicle,
+    entry_time,
+  ))
+
+  let ticket =
+    parking_ticket.new_parking_ticket(ticket_id, session_id, entry_time)
+
+  Ok(EntryParkingResult(
+    floor_id: floor_id,
+    slot: slot,
+    session: session,
+    ticket: ticket,
+  ))
+}
+
+// MARK: Slot Search
+
+fn find_available_slot(
+  floors: List(floor.ParkingFloor),
+  existing_sessions: List(parking_session.ParkingSession),
+  session_id: parking_session.ParkingSessionId,
+  candidate_vehicle: vehicle.Vehicle,
+  entry_time: Int,
+) -> Result(
+  #(
+    floor.ParkingFloorId,
+    parking_slot.ParkingSlot,
+    parking_session.ParkingSession,
+  ),
+  EntryParkingError,
+) {
+  case floors {
+    [] -> Error(NoAvailableParkingSlot)
+
+    [current_floor, ..remaining_floors] -> {
+      let floor_id = floor.get_parking_floor_id(current_floor)
+      let slots = floor.get_parking_floor_slots(current_floor)
+
+      case
+        find_available_slot_in_floor(
+          slots,
+          floor_id,
+          existing_sessions,
+          session_id,
+          candidate_vehicle,
+          entry_time,
+        )
+      {
+        Ok(allocation) -> Ok(allocation)
+
+        Error(NoAvailableParkingSlot) ->
+          find_available_slot(
+            remaining_floors,
+            existing_sessions,
+            session_id,
+            candidate_vehicle,
+            entry_time,
+          )
+
+        Error(error) -> Error(error)
+      }
+    }
+  }
+}
+
+// MARK: Floor Slot Search
+
+fn find_available_slot_in_floor(
+  slots: List(parking_slot.ParkingSlot),
+  floor_id: floor.ParkingFloorId,
+  existing_sessions: List(parking_session.ParkingSession),
+  session_id: parking_session.ParkingSessionId,
+  candidate_vehicle: vehicle.Vehicle,
+  entry_time: Int,
+) -> Result(
+  #(
+    floor.ParkingFloorId,
+    parking_slot.ParkingSlot,
+    parking_session.ParkingSession,
+  ),
+  EntryParkingError,
+) {
+  case slots {
+    [] -> Error(NoAvailableParkingSlot)
+
+    [current_slot, ..remaining_slots] ->
+      try_allocate_slot(
+        current_slot,
+        remaining_slots,
+        floor_id,
+        existing_sessions,
+        session_id,
+        candidate_vehicle,
+        entry_time,
+      )
+  }
+}
+
+// MARK: Slot Allocation Attempt
+
+fn try_allocate_slot(
+  slot: parking_slot.ParkingSlot,
+  remaining_slots: List(parking_slot.ParkingSlot),
+  floor_id: floor.ParkingFloorId,
+  existing_sessions: List(parking_session.ParkingSession),
+  session_id: parking_session.ParkingSessionId,
+  candidate_vehicle: vehicle.Vehicle,
+  entry_time: Int,
+) -> Result(
+  #(
+    floor.ParkingFloorId,
+    parking_slot.ParkingSlot,
+    parking_session.ParkingSession,
+  ),
+  EntryParkingError,
+) {
+  let request =
+    parking_allocation.ParkingAllocationRequest(
+      session_id: session_id,
+      vehicle: candidate_vehicle,
+      slot: slot,
+      entry_time: entry_time,
+    )
+
+  case parking_allocation.allocate_parking_session(existing_sessions, request) {
+    Ok(session) -> Ok(#(floor_id, slot, session))
+
+    Error(parking_allocation.VehicleTypeNotSupported) ->
+      find_available_slot_in_floor(
+        remaining_slots,
+        floor_id,
+        existing_sessions,
+        session_id,
+        candidate_vehicle,
+        entry_time,
+      )
+
+    Error(parking_allocation.ParkingSlotOccupied) ->
+      find_available_slot_in_floor(
+        remaining_slots,
+        floor_id,
+        existing_sessions,
+        session_id,
+        candidate_vehicle,
+        entry_time,
+      )
+
+    Error(error) -> Error(AllocationFailed(error))
+  }
+}
+
+
+============================================================
+FILE: src/application/entry_parking_service.gleam
+============================================================
+import application/entry_parking
+import application/ports/entry_parking_transaction
+import application/ports/repository_error
+
+// MARK: Errors
+
+pub type EntryParkingServiceError {
+  TransactionFailed(repository_error.RepositoryError)
+  EntryFailed(entry_parking.EntryParkingError)
+  TransactionRollbackFailed(
+    operation_error: entry_parking_transaction.EntryParkingTransactionError,
+    rollback_error: repository_error.RepositoryError,
+  )
+}
+
+pub fn error_message(error: EntryParkingServiceError) -> String {
+  case error {
+    TransactionFailed(repository_error.StorageError(message)) ->
+      "Failed to complete parking entry: " <> message
+
+    EntryFailed(entry_error) -> entry_parking.error_message(entry_error)
+
+    TransactionRollbackFailed(operation_error, rollback_error) ->
+      "Parking entry failed and rollback also failed. "
+      <> "Operation error: "
+      <> transaction_error_message(operation_error)
+      <> ". Rollback error: "
+      <> repository_error_message(rollback_error)
+  }
+}
+
+fn transaction_error_message(
+  error: entry_parking_transaction.EntryParkingTransactionError,
+) -> String {
+  case error {
+    entry_parking_transaction.RepositoryFailed(repository_error) ->
+      repository_error_message(repository_error)
+
+    entry_parking_transaction.EntryFailed(entry_error) ->
+      entry_parking.error_message(entry_error)
+
+    entry_parking_transaction.RollbackFailed(
+      operation_error: operation_error,
+      rollback_error: rollback_error,
+    ) ->
+      "Operation error: "
+      <> transaction_error_message(operation_error)
+      <> ". Rollback error: "
+      <> repository_error_message(rollback_error)
+  }
+}
+
+fn repository_error_message(error: repository_error.RepositoryError) -> String {
+  case error {
+    repository_error.StorageError(message) -> message
+  }
+}
+
+// MARK: Service Dependencies
+
+pub type EntryParkingService {
+  EntryParkingService(
+    transaction: entry_parking_transaction.EntryParkingTransaction,
+  )
+}
+
+pub fn new(
+  transaction: entry_parking_transaction.EntryParkingTransaction,
+) -> EntryParkingService {
+  EntryParkingService(transaction: transaction)
+}
+
+// MARK: Enter Parking
+
+pub fn enter(
+  service: EntryParkingService,
+  request: entry_parking.EntryParkingRequest,
+) -> Result(entry_parking.EntryParkingResult, EntryParkingServiceError) {
+  let EntryParkingService(transaction: transaction) = service
+
+  let entry_parking_transaction.EntryParkingTransaction(enter: enter) =
+    transaction
+
+  case enter(request) {
+    Ok(entry_result) -> Ok(entry_result)
+
+    Error(entry_parking_transaction.RepositoryFailed(error)) ->
+      Error(TransactionFailed(error))
+
+    Error(entry_parking_transaction.EntryFailed(error)) ->
+      Error(EntryFailed(error))
+
+    Error(entry_parking_transaction.RollbackFailed(
+      operation_error: operation_error,
+      rollback_error: rollback_error,
+    )) ->
+      Error(TransactionRollbackFailed(
+        operation_error: operation_error,
+        rollback_error: rollback_error,
+      ))
+  }
+}
+
+
+============================================================
+FILE: src/application/exit_parking.gleam
+============================================================
+import domain/parking_fee
+import domain/parking_session
+import domain/payment
+import gleam/option
+import gleam/result
+
+// MARK: Errors
+
+pub type ExitParkingError {
+  SessionNotFound
+  SessionClosingFailed(parking_session.ParkingSessionError)
+  FeeCalculationFailed(parking_fee.ParkingFeeError)
+  MissingPaymentId
+  PaymentCreationFailed(payment.PaymentError)
+  PaymentSettlementFailed(payment.PaymentError)
+}
+
+pub fn error_message(error: ExitParkingError) -> String {
+  case error {
+    SessionNotFound -> "Parking session was not found"
+
+    SessionClosingFailed(session_error) ->
+      parking_session.error_message(session_error)
+
+    FeeCalculationFailed(fee_error) -> parking_fee.error_message(fee_error)
+
+    MissingPaymentId ->
+      "Payment ID is required when parking fee is greater than zero"
+
+    PaymentCreationFailed(payment_error) -> payment.error_message(payment_error)
+
+    PaymentSettlementFailed(payment_error) ->
+      payment.error_message(payment_error)
+  }
+}
+
+// MARK: Exit Parking Request
+
+pub type ExitParkingRequest {
+  ExitParkingRequest(
+    session_id: parking_session.ParkingSessionId,
+    payment_id: option.Option(payment.PaymentId),
+    exit_time: Int,
+    hourly_rate: Int,
+    payment_method: payment.PaymentMethod,
+  )
+}
+
+// MARK: Exit Parking Result
+
+pub type ExitParkingResult {
+  ExitParkingResult(
+    session: parking_session.ParkingSession,
+    payment: option.Option(payment.Payment),
+    duration_seconds: Int,
+    fee: Int,
+  )
+}
+
+// MARK: Exit Parking
+
+pub fn exit_parking(
+  session: parking_session.ParkingSession,
+  request: ExitParkingRequest,
+) -> Result(ExitParkingResult, ExitParkingError) {
+  let ExitParkingRequest(
+    session_id: _,
+    payment_id: payment_id,
+    exit_time: exit_time,
+    hourly_rate: hourly_rate,
+    payment_method: payment_method,
+  ) = request
+
+  // Validate the session state and exit time first.
+  use closed_session <- result.try(
+    parking_session.close_parking_session(session, exit_time)
+    |> result.map_error(SessionClosingFailed),
+  )
+
+  // Calculate the actual parking duration.
+  let entry_time = parking_session.get_parking_session_entry_time(session)
+  let duration_seconds = exit_time - entry_time
+
+  // Calculate the parking fee.
+  use fee <- result.try(
+    parking_fee.calculate_parking_fee(duration_seconds, hourly_rate)
+    |> result.map_error(FeeCalculationFailed),
+  )
+
+  // No payment is necessary when the fee is zero.
+  case fee {
+    0 ->
+      Ok(ExitParkingResult(
+        session: closed_session,
+        payment: option.None,
+        duration_seconds: duration_seconds,
+        fee: fee,
+      ))
+
+    _ -> {
+      // A positive fee requires a payment ID.
+      use payment_id <- result.try(require_payment_id(payment_id))
+
+      // Create a pending payment.
+      use pending_payment <- result.try(
+        payment.new_payment(
+          payment_id,
+          parking_session.get_parking_session_id(session),
+          fee,
+          payment_method,
+          exit_time,
+        )
+        |> result.map_error(PaymentCreationFailed),
+      )
+
+      // Simulate successful payment settlement.
+      use settled_payment <- result.try(
+        payment.succeed_payment(pending_payment)
+        |> result.map_error(PaymentSettlementFailed),
+      )
+
+      Ok(ExitParkingResult(
+        session: closed_session,
+        payment: option.Some(settled_payment),
+        duration_seconds: duration_seconds,
+        fee: fee,
+      ))
+    }
+  }
+}
+
+// MARK: Payment ID Validation
+
+fn require_payment_id(
+  payment_id: option.Option(payment.PaymentId),
+) -> Result(payment.PaymentId, ExitParkingError) {
+  case payment_id {
+    option.Some(id) -> Ok(id)
+    option.None -> Error(MissingPaymentId)
+  }
+}
+
+
+============================================================
+FILE: src/application/exit_parking_service.gleam
+============================================================
+import application/exit_parking
+import application/ports/exit_parking_transaction
+import application/ports/repository_error
+
+// MARK: Errors
+pub type ExitParkingServiceError {
+  TransactionFailed(repository_error.RepositoryError)
+  ExitFailed(exit_parking.ExitParkingError)
+  TransactionRollbackFailed(
+    operation_error: exit_parking_transaction.ExitParkingTransactionError,
+    rollback_error: repository_error.RepositoryError,
+  )
+}
+
+pub fn error_message(error: ExitParkingServiceError) -> String {
+  case error {
+    TransactionFailed(repository_error.StorageError(message)) ->
+      "Failed to complete parking exit: " <> message
+
+    ExitFailed(exit_error) -> exit_parking.error_message(exit_error)
+
+    TransactionRollbackFailed(operation_error, rollback_error) ->
+      "Parking exit failed and rollback also failed. "
+      <> "Operation error: "
+      <> transaction_error_message(operation_error)
+      <> ". Rollback error: "
+      <> repository_error_message(rollback_error)
+  }
+}
+
+fn transaction_error_message(
+  error: exit_parking_transaction.ExitParkingTransactionError,
+) -> String {
+  case error {
+    exit_parking_transaction.RepositoryFailed(repository_error) ->
+      repository_error_message(repository_error)
+
+    exit_parking_transaction.ExitFailed(exit_error) ->
+      exit_parking.error_message(exit_error)
+
+    exit_parking_transaction.RollbackFailed(operation_error, rollback_error) ->
+      "Operation error: "
+      <> transaction_error_message(operation_error)
+      <> ". Rollback error: "
+      <> repository_error_message(rollback_error)
+  }
+}
+
+fn repository_error_message(error: repository_error.RepositoryError) -> String {
+  case error {
+    repository_error.StorageError(message) -> message
+  }
+}
+
+// MARK: Service Dependencies
+pub type ExitParkingService {
+  ExitParkingService(
+    transaction: exit_parking_transaction.ExitParkingTransaction,
+  )
+}
+
+pub fn new(
+  transaction: exit_parking_transaction.ExitParkingTransaction,
+) -> ExitParkingService {
+  ExitParkingService(transaction: transaction)
+}
+
+// MARK: Exit Parking
+pub fn exit(
+  service: ExitParkingService,
+  request: exit_parking.ExitParkingRequest,
+) -> Result(exit_parking.ExitParkingResult, ExitParkingServiceError) {
+  let ExitParkingService(transaction: transaction) = service
+
+  let exit_parking_transaction.ExitParkingTransaction(exit: exit) = transaction
+
+  case exit(request) {
+    Ok(exit_result) -> Ok(exit_result)
+
+    Error(exit_parking_transaction.RepositoryFailed(error)) ->
+      Error(TransactionFailed(error))
+
+    Error(exit_parking_transaction.ExitFailed(error)) ->
+      Error(ExitFailed(error))
+
+    Error(exit_parking_transaction.RollbackFailed(
+      operation_error,
+      rollback_error,
+    )) -> Error(TransactionRollbackFailed(operation_error, rollback_error))
+  }
+}
+
+
+============================================================
+FILE: src/application/ports/entry_parking_transaction.gleam
+============================================================
+import application/entry_parking
+import application/ports/repository_error
+
+// MARK: Entry Parking Transaction
+
+pub type EntryParkingTransaction {
+  EntryParkingTransaction(
+    enter: fn(entry_parking.EntryParkingRequest) ->
+      Result(entry_parking.EntryParkingResult, EntryParkingTransactionError),
+  )
+}
+
+// MARK: Errors
+
+pub type EntryParkingTransactionError {
+  RepositoryFailed(repository_error.RepositoryError)
+  EntryFailed(entry_parking.EntryParkingError)
+  RollbackFailed(
+    operation_error: EntryParkingTransactionError,
+    rollback_error: repository_error.RepositoryError,
+  )
+}
+
+
+============================================================
+FILE: src/application/ports/exit_parking_transaction.gleam
+============================================================
+import application/exit_parking
+import application/ports/repository_error
+
+// MARK: Exit Parking Transaction
+
+pub type ExitParkingTransaction {
+  ExitParkingTransaction(
+    exit: fn(exit_parking.ExitParkingRequest) ->
+      Result(exit_parking.ExitParkingResult, ExitParkingTransactionError),
+  )
+}
+
+// MARK: Errors
+
+pub type ExitParkingTransactionError {
+  RepositoryFailed(repository_error.RepositoryError)
+  ExitFailed(exit_parking.ExitParkingError)
+  RollbackFailed(
+    operation_error: ExitParkingTransactionError,
+    rollback_error: repository_error.RepositoryError,
+  )
+}
+
+
+============================================================
+FILE: src/application/ports/parking_floor_repository.gleam
+============================================================
+import application/ports/repository_error
+import domain/floor
+
+// MARK: Parking Floor Repository
+
+pub type ParkingFloorRepository {
+  ParkingFloorRepository(
+    get_all_floors: fn() ->
+      Result(List(floor.ParkingFloor), repository_error.RepositoryError),
+    save_floor: fn(floor.ParkingFloor) ->
+      Result(Nil, repository_error.RepositoryError),
+  )
+}
+
+
+============================================================
+FILE: src/application/ports/parking_session_repository.gleam
+============================================================
+import application/ports/repository_error
+import domain/parking_session
+import gleam/option
+
+// MARK: Parking Session Repository
+
+pub type ParkingSessionRepository {
+  ParkingSessionRepository(
+    get_active_sessions: fn() ->
+      Result(
+        List(parking_session.ParkingSession),
+        repository_error.RepositoryError,
+      ),
+    get_session: fn(parking_session.ParkingSessionId) ->
+      Result(
+        option.Option(parking_session.ParkingSession),
+        repository_error.RepositoryError,
+      ),
+  )
+}
+
+
+============================================================
+FILE: src/application/ports/parking_ticket_repository.gleam
+============================================================
+import application/ports/repository_error
+import domain/parking_ticket
+import gleam/option.{type Option}
+
+// MARK: Parking Ticket Repository
+
+pub type ParkingTicketRepository {
+  ParkingTicketRepository(
+    get_ticket: fn(parking_ticket.ParkingTicketId) ->
+      Result(
+        Option(parking_ticket.ParkingTicket),
+        repository_error.RepositoryError,
+      ),
+  )
+}
+
+
+============================================================
+FILE: src/application/ports/payment_repository.gleam
+============================================================
+import application/ports/repository_error
+import domain/payment
+import gleam/option.{type Option}
+
+// MARK: Payment Repository
+
+pub type PaymentRepository {
+  PaymentRepository(
+    get_payment: fn(payment.PaymentId) ->
+      Result(Option(payment.Payment), repository_error.RepositoryError),
+    save_payment: fn(payment.Payment) ->
+      Result(Nil, repository_error.RepositoryError),
+  )
+}
+
+
+============================================================
+FILE: src/application/ports/repository_error.gleam
+============================================================
+// Mark: Repository Errors
+
+pub type RepositoryError {
+  StorageError(String)
+}
+
+
+============================================================
+FILE: src/application/seed_parking_layout.gleam
+============================================================
+import application/ports/parking_floor_repository
+import application/ports/repository_error
+import domain/floor
+import domain/parking_slot
+import domain/vehicle
+import gleam/list
+import gleam/result
+
+pub type SeedParkingLayoutError {
+  InvalidFloorId(floor.ParkingFloorError)
+  InvalidSlotId(parking_slot.ParkingSlotError)
+  FloorConfigurationFailed(floor.ParkingFloorError)
+  RepositoryFailed(repository_error.RepositoryError)
+}
+
+pub fn seed(
+  repository: parking_floor_repository.ParkingFloorRepository,
+) -> Result(Nil, SeedParkingLayoutError) {
+  let parking_floor_repository.ParkingFloorRepository(
+    save_floor: save_floor,
+    ..,
+  ) = repository
+
+  use first_floor <- result.try(
+    build_floor("F1", [
+      #("M-01", vehicle.Motorcycle),
+      #("M-02", vehicle.Motorcycle),
+      #("C-01", vehicle.Car),
+      #("C-02", vehicle.Car),
+      #("T-01", vehicle.Truck),
+    ]),
+  )
+
+  use _ <- result.try(
+    save_floor(first_floor)
+    |> result.map_error(RepositoryFailed),
+  )
+
+  use second_floor <- result.try(
+    build_floor("F2", [
+      #("M-03", vehicle.Motorcycle),
+      #("C-03", vehicle.Car),
+      #("C-04", vehicle.Car),
+    ]),
+  )
+
+  save_floor(second_floor)
+  |> result.map_error(RepositoryFailed)
+}
+
+fn build_floor(
+  floor_id_value: String,
+  slot_definitions: List(#(String, vehicle.VehicleType)),
+) -> Result(floor.ParkingFloor, SeedParkingLayoutError) {
+  use floor_id <- result.try(
+    floor.new_parking_floor_id(floor_id_value)
+    |> result.map_error(InvalidFloorId),
+  )
+
+  let initial_floor = floor.new_parking_floor(floor_id)
+
+  list.fold(slot_definitions, Ok(initial_floor), fn(acc, definition) {
+    use current_floor <- result.try(acc)
+
+    let #(slot_id_value, supported_vehicle_type) = definition
+
+    use slot_id <- result.try(
+      parking_slot.new_parking_slot_id(slot_id_value)
+      |> result.map_error(InvalidSlotId),
+    )
+
+    let slot = parking_slot.new_parking_slot(slot_id, supported_vehicle_type)
+
+    floor.add_parking_slot(current_floor, slot)
+    |> result.map_error(FloorConfigurationFailed)
+  })
+}
+
+
+============================================================
+FILE: src/domain/floor.gleam
+============================================================
+import domain/parking_slot
+import gleam/list
+import gleam/string
+
+// MARK: Errors
+
+pub type ParkingFloorError {
+  EmptyParkingFloorId
+  ParkingSlotAlreadyOnFloor
+}
+
+pub fn error_message(error: ParkingFloorError) -> String {
+  case error {
+    EmptyParkingFloorId -> "Parking floor ID cannot be empty"
+
+    ParkingSlotAlreadyOnFloor -> "Parking slot already exists on this floor"
+  }
+}
+
+// MARK: Parking Floor ID
+
+pub opaque type ParkingFloorId {
+  ParkingFloorId(String)
+}
+
+pub fn new_parking_floor_id(
+  value: String,
+) -> Result(ParkingFloorId, ParkingFloorError) {
+  let trimmed = string.trim(value)
+
+  case trimmed {
+    "" -> Error(EmptyParkingFloorId)
+    _ -> Ok(ParkingFloorId(trimmed))
+  }
+}
+
+pub fn get_parking_floor_id_value(id: ParkingFloorId) -> String {
+  let ParkingFloorId(value) = id
+  value
+}
+
+// MARK: Parking Floor
+
+pub opaque type ParkingFloor {
+  ParkingFloor(id: ParkingFloorId, slots: List(parking_slot.ParkingSlot))
+}
+
+pub fn new_parking_floor(id: ParkingFloorId) -> ParkingFloor {
+  ParkingFloor(id: id, slots: [])
+}
+
+// MARK: Accessors
+
+pub fn get_parking_floor_id(floor: ParkingFloor) -> ParkingFloorId {
+  let ParkingFloor(id: id, ..) = floor
+  id
+}
+
+pub fn get_parking_floor_slots(
+  floor: ParkingFloor,
+) -> List(parking_slot.ParkingSlot) {
+  let ParkingFloor(slots: slots, ..) = floor
+  slots
+}
+
+pub fn get_parking_floor_slot_count(floor: ParkingFloor) -> Int {
+  list.length(get_parking_floor_slots(floor))
+}
+
+// MARK: Add Slot
+
+pub fn add_parking_slot(
+  floor: ParkingFloor,
+  slot: parking_slot.ParkingSlot,
+) -> Result(ParkingFloor, ParkingFloorError) {
+  let slots = get_parking_floor_slots(floor)
+  let slot_id = parking_slot.get_parking_slot_id(slot)
+
+  let already_exists =
+    list.any(slots, fn(existing_slot) {
+      parking_slot.get_parking_slot_id(existing_slot) == slot_id
+    })
+
+  case already_exists {
+    True -> Error(ParkingSlotAlreadyOnFloor)
+
+    False -> Ok(ParkingFloor(..floor, slots: list.append(slots, [slot])))
+  }
+}
+
+
+============================================================
+FILE: src/domain/parking_allocation.gleam
+============================================================
+import domain/parking_session
+import domain/parking_slot
+import domain/vehicle
+import gleam/list
+import gleam/result
+
+// MARK: Errors
+
+pub type ParkingAllocationError {
+  VehicleAlreadyParked
+  ParkingSlotOccupied
+  VehicleTypeNotSupported
+  InvalidEntryTime
+  InvalidParkingSession
+}
+
+pub type ParkingAllocationResult(a) =
+  Result(a, ParkingAllocationError)
+
+pub fn error_message(error: ParkingAllocationError) -> String {
+  case error {
+    VehicleAlreadyParked -> "Vehicle already has an active parking session"
+
+    ParkingSlotOccupied -> "Parking slot is already occupied"
+
+    VehicleTypeNotSupported ->
+      "Vehicle type is not supported by this parking slot"
+
+    InvalidEntryTime -> "Entry time cannot be negative"
+
+    InvalidParkingSession -> "Could not create a valid parking session"
+  }
+}
+
+// MARK: Allocation Request
+
+pub type ParkingAllocationRequest {
+  ParkingAllocationRequest(
+    session_id: parking_session.ParkingSessionId,
+    vehicle: vehicle.Vehicle,
+    slot: parking_slot.ParkingSlot,
+    entry_time: Int,
+  )
+}
+
+// MARK: Allocation
+
+pub fn allocate_parking_session(
+  existing_sessions: List(parking_session.ParkingSession),
+  request: ParkingAllocationRequest,
+) -> ParkingAllocationResult(parking_session.ParkingSession) {
+  let ParkingAllocationRequest(
+    session_id: session_id,
+    vehicle: candidate_vehicle,
+    slot: slot,
+    entry_time: entry_time,
+  ) = request
+
+  let vehicle_id = vehicle.get_vehicle_id(candidate_vehicle)
+  let slot_id = parking_slot.get_parking_slot_id(slot)
+
+  use _ <- result.try(validate_vehicle_type(candidate_vehicle, slot))
+
+  use _ <- result.try(validate_vehicle_availability(
+    existing_sessions,
+    vehicle_id,
+  ))
+
+  use _ <- result.try(validate_slot_availability(existing_sessions, slot_id))
+
+  construct_parking_session(session_id, vehicle_id, slot_id, entry_time)
+}
+
+// MARK: Validation
+
+fn validate_vehicle_type(
+  candidate_vehicle: vehicle.Vehicle,
+  slot: parking_slot.ParkingSlot,
+) -> ParkingAllocationResult(Nil) {
+  case parking_slot.supports_vehicle(slot, candidate_vehicle) {
+    True -> Ok(Nil)
+    False -> Error(VehicleTypeNotSupported)
+  }
+}
+
+fn validate_vehicle_availability(
+  sessions: List(parking_session.ParkingSession),
+  vehicle_id: vehicle.VehicleId,
+) -> ParkingAllocationResult(Nil) {
+  case vehicle_has_active_session(sessions, vehicle_id) {
+    True -> Error(VehicleAlreadyParked)
+    False -> Ok(Nil)
+  }
+}
+
+fn validate_slot_availability(
+  sessions: List(parking_session.ParkingSession),
+  slot_id: parking_slot.ParkingSlotId,
+) -> ParkingAllocationResult(Nil) {
+  case slot_has_active_session(sessions, slot_id) {
+    True -> Error(ParkingSlotOccupied)
+    False -> Ok(Nil)
+  }
+}
+
+// MARK: Active Session Queries
+
+fn vehicle_has_active_session(
+  sessions: List(parking_session.ParkingSession),
+  vehicle_id: vehicle.VehicleId,
+) -> Bool {
+  list.any(sessions, fn(session) {
+    case parking_session.get_parking_session_state(session) {
+      parking_session.Active ->
+        parking_session.get_parking_session_vehicle_id(session) == vehicle_id
+
+      parking_session.Closed(_) -> False
+    }
+  })
+}
+
+fn slot_has_active_session(
+  sessions: List(parking_session.ParkingSession),
+  slot_id: parking_slot.ParkingSlotId,
+) -> Bool {
+  list.any(sessions, fn(session) {
+    case parking_session.get_parking_session_state(session) {
+      parking_session.Active ->
+        parking_session.get_parking_session_slot_id(session) == slot_id
+
+      parking_session.Closed(_) -> False
+    }
+  })
+}
+
+// MARK: Session Construction
+
+fn construct_parking_session(
+  session_id: parking_session.ParkingSessionId,
+  vehicle_id: vehicle.VehicleId,
+  slot_id: parking_slot.ParkingSlotId,
+  entry_time: Int,
+) -> ParkingAllocationResult(parking_session.ParkingSession) {
+  case
+    parking_session.new_parking_session(
+      session_id,
+      vehicle_id,
+      slot_id,
+      entry_time,
+    )
+  {
+    Ok(session) -> Ok(session)
+
+    Error(parking_session.InvalidEntryTime) -> Error(InvalidEntryTime)
+
+    Error(_) -> Error(InvalidParkingSession)
+  }
+}
+
+
+============================================================
+FILE: src/domain/parking_fee.gleam
+============================================================
+import gleam/int
+
+// MARK: Errors
+
+pub type ParkingFeeError {
+  InvalidDuration
+  InvalidHourlyRate
+}
+
+pub fn error_message(error: ParkingFeeError) -> String {
+  case error {
+    InvalidDuration -> "Parking duration cannot be negative"
+    InvalidHourlyRate -> "Hourly rate must be greater than zero"
+  }
+}
+
+// MARK: Constants
+
+const seconds_per_hour = 3600
+
+const rounding_offset = 1800
+
+// MARK: Fee Calculation
+
+/// Calculates a parking fee proportionally to the actual duration.
+///
+/// The result is rounded to the nearest whole rupiah.
+/// A half-rupiah is rounded up.
+///
+/// Example:
+/// - 10 minutes at Rp5,000/hour = Rp833
+/// - 30 minutes at Rp5,000/hour = Rp2,500
+pub fn calculate_parking_fee(
+  duration_seconds: Int,
+  hourly_rate: Int,
+) -> Result(Int, ParkingFeeError) {
+  case duration_seconds < 0 {
+    True -> Error(InvalidDuration)
+    False -> {
+      case hourly_rate <= 0 {
+        True -> Error(InvalidHourlyRate)
+        False -> {
+          let numerator = duration_seconds * hourly_rate + rounding_offset
+
+          // The denominator is a non-zero constant, so division
+          // cannot fail.
+          let assert Ok(fee) = int.divide(numerator, seconds_per_hour)
+
+          Ok(fee)
+        }
+      }
+    }
+  }
+}
+
+
+============================================================
+FILE: src/domain/parking_pricing_policy.gleam
+============================================================
+import domain/vehicle
+import gleam/result
+
+// MARK: Errors
+
+pub type ParkingPricingPolicyError {
+  InvalidMotorcycleHourlyRate
+  InvalidCarHourlyRate
+  InvalidTruckHourlyRate
+}
+
+pub fn error_message(error: ParkingPricingPolicyError) -> String {
+  case error {
+    InvalidMotorcycleHourlyRate ->
+      "Motorcycle hourly rate must be greater than zero"
+
+    InvalidCarHourlyRate -> "Car hourly rate must be greater than zero"
+
+    InvalidTruckHourlyRate -> "Truck hourly rate must be greater than zero"
+  }
+}
+
+// MARK: Parking Pricing Policy
+
+pub opaque type ParkingPricingPolicy {
+  ParkingPricingPolicy(
+    motorcycle_hourly_rate: Int,
+    car_hourly_rate: Int,
+    truck_hourly_rate: Int,
+  )
+}
+
+// MARK: Constructor
+
+fn validate_motorcycle_rate(
+  rate: Int,
+) -> Result(Nil, ParkingPricingPolicyError) {
+  case rate > 0 {
+    True -> Ok(Nil)
+    False -> Error(InvalidMotorcycleHourlyRate)
+  }
+}
+
+fn validate_car_rate(rate: Int) -> Result(Nil, ParkingPricingPolicyError) {
+  case rate > 0 {
+    True -> Ok(Nil)
+    False -> Error(InvalidCarHourlyRate)
+  }
+}
+
+fn validate_truck_rate(rate: Int) -> Result(Nil, ParkingPricingPolicyError) {
+  case rate > 0 {
+    True -> Ok(Nil)
+    False -> Error(InvalidTruckHourlyRate)
+  }
+}
+
+pub fn new_parking_pricing_policy(
+  motorcycle_hourly_rate: Int,
+  car_hourly_rate: Int,
+  truck_hourly_rate: Int,
+) -> Result(ParkingPricingPolicy, ParkingPricingPolicyError) {
+  use _ <- result.try(validate_motorcycle_rate(motorcycle_hourly_rate))
+  use _ <- result.try(validate_car_rate(car_hourly_rate))
+  use _ <- result.try(validate_truck_rate(truck_hourly_rate))
+
+  Ok(ParkingPricingPolicy(
+    motorcycle_hourly_rate: motorcycle_hourly_rate,
+    car_hourly_rate: car_hourly_rate,
+    truck_hourly_rate: truck_hourly_rate,
+  ))
+}
+
+// MARK: Accessors
+
+pub fn get_motorcycle_hourly_rate(policy: ParkingPricingPolicy) -> Int {
+  let ParkingPricingPolicy(motorcycle_hourly_rate: rate, ..) = policy
+  rate
+}
+
+pub fn get_car_hourly_rate(policy: ParkingPricingPolicy) -> Int {
+  let ParkingPricingPolicy(car_hourly_rate: rate, ..) = policy
+  rate
+}
+
+pub fn get_truck_hourly_rate(policy: ParkingPricingPolicy) -> Int {
+  let ParkingPricingPolicy(truck_hourly_rate: rate, ..) = policy
+  rate
+}
+
+// MARK: Rate Lookup
+
+pub fn get_hourly_rate(
+  policy: ParkingPricingPolicy,
+  vehicle_type: vehicle.VehicleType,
+) -> Int {
+  case vehicle_type {
+    vehicle.Motorcycle -> get_motorcycle_hourly_rate(policy)
+    vehicle.Car -> get_car_hourly_rate(policy)
+    vehicle.Truck -> get_truck_hourly_rate(policy)
+  }
+}
+
+
+============================================================
+FILE: src/domain/parking_session.gleam
+============================================================
+import domain/parking_slot
+import domain/vehicle
+import gleam/option
+import gleam/result
+import gleam/string
+
+// MARK: Errors
+
+pub type ParkingSessionError {
+  EmptyParkingSessionId
+  InvalidEntryTime
+  InvalidExitTime
+  ParkingSessionAlreadyClosed
+}
+
+pub fn error_message(error: ParkingSessionError) -> String {
+  case error {
+    EmptyParkingSessionId -> "Parking session ID cannot be empty"
+    InvalidEntryTime -> "Entry time cannot be negative"
+    InvalidExitTime -> "Exit time cannot be earlier than entry time"
+    ParkingSessionAlreadyClosed -> "Parking session is already closed"
+  }
+}
+
+// MARK: Session State
+
+pub type SessionState {
+  Active
+  Closed(exit_time: Int)
+}
+
+// MARK: Parking Session ID
+
+pub opaque type ParkingSessionId {
+  ParkingSessionId(String)
+}
+
+// MARK: Parking Session
+
+pub opaque type ParkingSession {
+  ParkingSession(
+    id: ParkingSessionId,
+    vehicle_id: vehicle.VehicleId,
+    slot_id: parking_slot.ParkingSlotId,
+    entry_time: Int,
+    state: SessionState,
+  )
+}
+
+// MARK: Constructor
+
+fn validate_parking_session_id(
+  value: String,
+) -> Result(Nil, ParkingSessionError) {
+  case value == "" {
+    True -> Error(EmptyParkingSessionId)
+    False -> Ok(Nil)
+  }
+}
+
+fn validate_entry_time(entry_time: Int) -> Result(Nil, ParkingSessionError) {
+  case entry_time >= 0 {
+    True -> Ok(Nil)
+    False -> Error(InvalidEntryTime)
+  }
+}
+
+pub fn new_parking_session_id(
+  value: String,
+) -> Result(ParkingSessionId, ParkingSessionError) {
+  let trimmed = string.trim(value)
+
+  use _ <- result.try(validate_parking_session_id(trimmed))
+
+  Ok(ParkingSessionId(trimmed))
+}
+
+pub fn get_parking_session_id_value(id: ParkingSessionId) -> String {
+  let ParkingSessionId(value) = id
+  value
+}
+
+pub fn new_parking_session(
+  id: ParkingSessionId,
+  vehicle_id: vehicle.VehicleId,
+  slot_id: parking_slot.ParkingSlotId,
+  entry_time: Int,
+) -> Result(ParkingSession, ParkingSessionError) {
+  use _ <- result.try(validate_entry_time(entry_time))
+
+  Ok(ParkingSession(
+    id: id,
+    vehicle_id: vehicle_id,
+    slot_id: slot_id,
+    entry_time: entry_time,
+    state: Active,
+  ))
+}
+
+// MARK: Accessors
+
+pub fn get_parking_session_id(session: ParkingSession) -> ParkingSessionId {
+  session.id
+}
+
+pub fn get_parking_session_vehicle_id(
+  session: ParkingSession,
+) -> vehicle.VehicleId {
+  session.vehicle_id
+}
+
+pub fn get_parking_session_slot_id(
+  session: ParkingSession,
+) -> parking_slot.ParkingSlotId {
+  session.slot_id
+}
+
+pub fn get_parking_session_entry_time(session: ParkingSession) -> Int {
+  session.entry_time
+}
+
+pub fn get_parking_session_state(session: ParkingSession) -> SessionState {
+  session.state
+}
+
+pub fn get_parking_session_exit_time(
+  session: ParkingSession,
+) -> option.Option(Int) {
+  case session.state {
+    Active -> option.None
+    Closed(exit_time) -> option.Some(exit_time)
+  }
+}
+
+// MARK: Close Parking Session
+
+fn validate_session_is_active(
+  state: SessionState,
+) -> Result(Nil, ParkingSessionError) {
+  case state {
+    Active -> Ok(Nil)
+    Closed(_) -> Error(ParkingSessionAlreadyClosed)
+  }
+}
+
+fn validate_exit_time(
+  entry_time: Int,
+  exit_time: Int,
+) -> Result(Nil, ParkingSessionError) {
+  case exit_time >= entry_time {
+    True -> Ok(Nil)
+    False -> Error(InvalidExitTime)
+  }
+}
+
+pub fn close_parking_session(
+  session: ParkingSession,
+  exit_time: Int,
+) -> Result(ParkingSession, ParkingSessionError) {
+  use _ <- result.try(validate_session_is_active(session.state))
+  use _ <- result.try(validate_exit_time(session.entry_time, exit_time))
+
+  Ok(ParkingSession(
+    id: session.id,
+    vehicle_id: session.vehicle_id,
+    slot_id: session.slot_id,
+    entry_time: session.entry_time,
+    state: Closed(exit_time),
+  ))
+}
+
+
+============================================================
+FILE: src/domain/parking_slot.gleam
+============================================================
+import domain/vehicle
+import gleam/string
+
+// MARK: Errors
+
+pub type ParkingSlotError {
+  EmptyParkingSlotId
+}
+
+pub fn error_message(error: ParkingSlotError) -> String {
+  case error {
+    EmptyParkingSlotId -> "Parking slot ID cannot be empty"
+  }
+}
+
+// MARK: Parking Slot ID
+
+pub opaque type ParkingSlotId {
+  ParkingSlotId(String)
+}
+
+pub fn new_parking_slot_id(
+  value: String,
+) -> Result(ParkingSlotId, ParkingSlotError) {
+  let trimmed = string.trim(value)
+
+  case trimmed {
+    "" -> Error(EmptyParkingSlotId)
+    _ -> Ok(ParkingSlotId(trimmed))
+  }
+}
+
+pub fn get_parking_slot_id_value(id: ParkingSlotId) -> String {
+  let ParkingSlotId(value) = id
+  value
+}
+
+// MARK: Parking Slot
+
+pub opaque type ParkingSlot {
+  ParkingSlot(id: ParkingSlotId, supported_vehicle_type: vehicle.VehicleType)
+}
+
+pub fn new_parking_slot(
+  id: ParkingSlotId,
+  supported_vehicle_type: vehicle.VehicleType,
+) -> ParkingSlot {
+  ParkingSlot(id: id, supported_vehicle_type: supported_vehicle_type)
+}
+
+pub fn get_parking_slot_id(slot: ParkingSlot) -> ParkingSlotId {
+  let ParkingSlot(id: id, ..) = slot
+  id
+}
+
+pub fn get_supported_vehicle_type(slot: ParkingSlot) -> vehicle.VehicleType {
+  let ParkingSlot(supported_vehicle_type: vehicle_type, ..) = slot
+  vehicle_type
+}
+
+// MARK: Vehicle Compatibility
+
+pub fn supports_vehicle(slot: ParkingSlot, vehicle: vehicle.Vehicle) -> Bool {
+  get_supported_vehicle_type(slot) == vehicle.get_vehicle_type(vehicle)
+}
+
+
+============================================================
+FILE: src/domain/parking_ticket.gleam
+============================================================
+import domain/parking_session
+import gleam/string
+
+// MARK: Errors
+
+pub type ParkingTicketError {
+  EmptyParkingTicketId
+}
+
+pub fn error_message(error: ParkingTicketError) -> String {
+  case error {
+    EmptyParkingTicketId -> "Parking ticket ID cannot be empty"
+  }
+}
+
+// MARK: Parking Ticket ID
+
+pub opaque type ParkingTicketId {
+  ParkingTicketId(String)
+}
+
+pub fn new_parking_ticket_id(
+  value: String,
+) -> Result(ParkingTicketId, ParkingTicketError) {
+  let trimmed = string.trim(value)
+
+  case trimmed {
+    "" -> Error(EmptyParkingTicketId)
+    _ -> Ok(ParkingTicketId(trimmed))
+  }
+}
+
+pub fn get_parking_ticket_id_value(id: ParkingTicketId) -> String {
+  let ParkingTicketId(value) = id
+  value
+}
+
+// MARK: Parking Ticket
+
+pub opaque type ParkingTicket {
+  ParkingTicket(
+    id: ParkingTicketId,
+    session_id: parking_session.ParkingSessionId,
+    issued_at: Int,
+  )
+}
+
+// MARK: Constructor
+
+pub fn new_parking_ticket(
+  id: ParkingTicketId,
+  session_id: parking_session.ParkingSessionId,
+  issued_at: Int,
+) -> ParkingTicket {
+  ParkingTicket(id: id, session_id: session_id, issued_at: issued_at)
+}
+
+// MARK: Accessors
+
+pub fn get_parking_ticket_id(ticket: ParkingTicket) -> ParkingTicketId {
+  let ParkingTicket(id: id, ..) = ticket
+  id
+}
+
+pub fn get_parking_ticket_session_id(
+  ticket: ParkingTicket,
+) -> parking_session.ParkingSessionId {
+  let ParkingTicket(session_id: session_id, ..) = ticket
+  session_id
+}
+
+pub fn get_parking_ticket_issued_at(ticket: ParkingTicket) -> Int {
+  let ParkingTicket(issued_at: issued_at, ..) = ticket
+  issued_at
+}
+
+
+============================================================
+FILE: src/domain/payment.gleam
+============================================================
+import domain/parking_session
+import gleam/string
+
+// MARK: Errors
+
+pub type PaymentError {
+  EmptyPaymentId
+  InvalidPaymentAmount
+  PaymentAlreadyFinalized
+}
+
+pub fn error_message(error: PaymentError) -> String {
+  case error {
+    EmptyPaymentId -> "Payment ID cannot be empty"
+    InvalidPaymentAmount -> "Payment amount must be greater than zero"
+    PaymentAlreadyFinalized -> "Payment has already been finalized"
+  }
+}
+
+// MARK: Payment ID
+
+pub opaque type PaymentId {
+  PaymentId(String)
+}
+
+pub fn new_payment_id(value: String) -> Result(PaymentId, PaymentError) {
+  let trimmed = string.trim(value)
+
+  case trimmed {
+    "" -> Error(EmptyPaymentId)
+    _ -> Ok(PaymentId(trimmed))
+  }
+}
+
+pub fn get_payment_id_value(id: PaymentId) -> String {
+  let PaymentId(value) = id
+  value
+}
+
+// MARK: Payment Method
+
+pub type PaymentMethod {
+  Cash
+  Qris
+  DebitCard
+  EWallet
+}
+
+// MARK: Payment Status
+
+pub type PaymentStatus {
+  Pending
+  Succeeded
+  Failed
+  Cancelled
+}
+
+// MARK: Payment
+
+pub opaque type Payment {
+  Payment(
+    id: PaymentId,
+    session_id: parking_session.ParkingSessionId,
+    amount: Int,
+    method: PaymentMethod,
+    status: PaymentStatus,
+    created_at: Int,
+  )
+}
+
+// MARK: Constructor
+
+pub fn new_payment(
+  id: PaymentId,
+  session_id: parking_session.ParkingSessionId,
+  amount: Int,
+  method: PaymentMethod,
+  created_at: Int,
+) -> Result(Payment, PaymentError) {
+  case amount > 0 {
+    True ->
+      Ok(Payment(
+        id: id,
+        session_id: session_id,
+        amount: amount,
+        method: method,
+        status: Pending,
+        created_at: created_at,
+      ))
+
+    False -> Error(InvalidPaymentAmount)
+  }
+}
+
+// MARK: Accessors
+
+pub fn get_payment_id(payment: Payment) -> PaymentId {
+  let Payment(id: id, ..) = payment
+  id
+}
+
+pub fn get_payment_session_id(
+  payment: Payment,
+) -> parking_session.ParkingSessionId {
+  let Payment(session_id: session_id, ..) = payment
+  session_id
+}
+
+pub fn get_payment_amount(payment: Payment) -> Int {
+  let Payment(amount: amount, ..) = payment
+  amount
+}
+
+pub fn get_payment_method(payment: Payment) -> PaymentMethod {
+  let Payment(method: method, ..) = payment
+  method
+}
+
+pub fn get_payment_status(payment: Payment) -> PaymentStatus {
+  let Payment(status: status, ..) = payment
+  status
+}
+
+pub fn get_payment_created_at(payment: Payment) -> Int {
+  let Payment(created_at: created_at, ..) = payment
+  created_at
+}
+
+// MARK: State Transitions
+
+pub fn succeed_payment(payment: Payment) -> Result(Payment, PaymentError) {
+  transition_to(payment, Succeeded)
+}
+
+pub fn fail_payment(payment: Payment) -> Result(Payment, PaymentError) {
+  transition_to(payment, Failed)
+}
+
+pub fn cancel_payment(payment: Payment) -> Result(Payment, PaymentError) {
+  transition_to(payment, Cancelled)
+}
+
+fn transition_to(
+  payment: Payment,
+  new_status: PaymentStatus,
+) -> Result(Payment, PaymentError) {
+  case payment.status {
+    Pending -> Ok(Payment(..payment, status: new_status))
+
+    Succeeded | Failed | Cancelled -> Error(PaymentAlreadyFinalized)
+  }
+}
+
+
+============================================================
+FILE: src/domain/vehicle.gleam
+============================================================
+import gleam/string
+
+// MARK: Errors
+
+pub type VehicleError {
+  EmptyVehicleId
+  EmptyPlateNumber
+}
+
+pub fn error_message(error: VehicleError) -> String {
+  case error {
+    EmptyVehicleId -> "Vehicle ID cannot be empty"
+    EmptyPlateNumber -> "Plate number cannot be empty"
+  }
+}
+
+// MARK: Vehicle ID
+
+pub opaque type VehicleId {
+  VehicleId(String)
+}
+
+// A VehicleId is valid if its trimmed value is not empty.
+pub fn new_vehicle_id(value: String) -> Result(VehicleId, VehicleError) {
+  let trimmed = string.trim(value)
+
+  case trimmed {
+    "" -> Error(EmptyVehicleId)
+    _ -> Ok(VehicleId(trimmed))
+  }
+}
+
+// Returns the string value of a VehicleId.
+pub fn get_vehicle_id_value(id: VehicleId) -> String {
+  let VehicleId(value) = id
+  value
+}
+
+// MARK: Plate Number
+
+pub opaque type PlateNumber {
+  PlateNumber(String)
+}
+
+// A PlateNumber is valid if its trimmed value is not empty.
+pub fn new_plate_number(value: String) -> Result(PlateNumber, VehicleError) {
+  let trimmed = string.trim(value)
+
+  case trimmed {
+    "" -> Error(EmptyPlateNumber)
+    _ -> Ok(PlateNumber(trimmed))
+  }
+}
+
+// Returns the string value of a PlateNumber.
+pub fn get_plate_number_value(plate: PlateNumber) -> String {
+  let PlateNumber(value) = plate
+  value
+}
+
+// MARK: Vehicle Type
+
+pub type VehicleType {
+  Motorcycle
+  Car
+  Truck
+}
+
+// MARK: Vehicle
+
+pub opaque type Vehicle {
+  Vehicle(id: VehicleId, plate_number: PlateNumber, vehicle_type: VehicleType)
+}
+
+pub fn new_vehicle(
+  id: VehicleId,
+  plate_number: PlateNumber,
+  vehicle_type: VehicleType,
+) -> Vehicle {
+  Vehicle(id: id, plate_number: plate_number, vehicle_type: vehicle_type)
+}
+
+pub fn get_vehicle_id(vehicle: Vehicle) -> VehicleId {
+  let Vehicle(id: id, ..) = vehicle
+  id
+}
+
+pub fn get_vehicle_plate_number(vehicle: Vehicle) -> PlateNumber {
+  let Vehicle(plate_number: plate_number, ..) = vehicle
+  plate_number
+}
+
+pub fn get_vehicle_type(vehicle: Vehicle) -> VehicleType {
+  let Vehicle(vehicle_type: vehicle_type, ..) = vehicle
+  vehicle_type
+}
+
+
+============================================================
+FILE: src/infrastructure/sqlite_connection.gleam
+============================================================
+import application/ports/repository_error
+import sqlight
+
+/// Membuka koneksi ke database utama.
+pub fn connect() -> Result(sqlight.Connection, repository_error.RepositoryError) {
+  connect_to("priv/repo/parking_lot.db")
+}
+
+/// Membuka koneksi ke database berdasarkan path.
+///
+/// Foreign key diaktifkan untuk setiap koneksi.
+pub fn connect_to(
+  path: String,
+) -> Result(sqlight.Connection, repository_error.RepositoryError) {
+  case sqlight.open(path) {
+    Ok(connection) -> {
+      case sqlight.exec("PRAGMA foreign_keys = ON;", on: connection) {
+        Ok(Nil) -> Ok(connection)
+
+        Error(error) -> {
+          let storage_error = to_repository_error(error)
+
+          case sqlight.close(connection) {
+            Ok(Nil) -> Error(storage_error)
+            Error(_) -> Error(storage_error)
+          }
+        }
+      }
+    }
+
+    Error(error) -> Error(to_repository_error(error))
+  }
+}
+
+/// Mengubah error SQLight menjadi RepositoryError.
+fn to_repository_error(
+  error: sqlight.Error,
+) -> repository_error.RepositoryError {
+  case error {
+    sqlight.SqlightError(_, message, _) ->
+      repository_error.StorageError(message)
+  }
+}
+
+
+============================================================
+FILE: src/infrastructure/sqlite_database.gleam
+============================================================
+import application/ports/repository_error
+import gleam/result
+import infrastructure/sqlite_connection
+import infrastructure/sqlite_migration
+import sqlight
+
+const migrations_dir = "priv/repo/migrations"
+
+/// Open main database and make sure migrations done already
+/// use the same connection for migration and repository
+pub fn connect() -> Result(sqlight.Connection, repository_error.RepositoryError) {
+  use db <- result.try(sqlite_connection.connect())
+
+  case sqlite_migration.migrate(db, migrations_dir) {
+    Ok(Nil) -> Ok(db)
+
+    Error(message) -> {
+      let _ = sqlight.close(db)
+
+      Error(repository_error.StorageError(
+        "Database migration failed: " <> message,
+      ))
+    }
+  }
+}
+
+
+============================================================
+FILE: src/infrastructure/sqlite_entry_parking_transaction.gleam
+============================================================
+import application/entry_parking
+import application/ports/entry_parking_transaction
+import application/ports/repository_error
+import domain/parking_session
+import domain/parking_slot
+import domain/parking_ticket
+import domain/vehicle
+import gleam/dynamic/decode
+import gleam/result
+import infrastructure/sqlite_floor_repository
+import infrastructure/sqlite_session_repository
+import sqlight
+
+// MARK: SQLite Entry Parking Transaction
+
+pub type SqliteEntryParkingTransaction {
+  SqliteEntryParkingTransaction(db: sqlight.Connection)
+}
+
+// MARK: Constructor
+
+pub fn new(db: sqlight.Connection) -> SqliteEntryParkingTransaction {
+  SqliteEntryParkingTransaction(db: db)
+}
+
+// MARK: Port Adapter
+
+pub fn to_port(
+  repository: SqliteEntryParkingTransaction,
+) -> entry_parking_transaction.EntryParkingTransaction {
+  entry_parking_transaction.EntryParkingTransaction(enter: fn(request) {
+    enter(repository, request)
+  })
+}
+
+// MARK: Enter Parking
+
+pub fn enter(
+  repository: SqliteEntryParkingTransaction,
+  request: entry_parking.EntryParkingRequest,
+) -> Result(
+  entry_parking.EntryParkingResult,
+  entry_parking_transaction.EntryParkingTransactionError,
+) {
+  let SqliteEntryParkingTransaction(db: db) = repository
+
+  with_transaction(db, fn() { enter_in_transaction(db, request) })
+}
+
+// MARK: Transaction Lifecycle
+
+fn with_transaction(
+  db: sqlight.Connection,
+  operation: fn() ->
+    Result(a, entry_parking_transaction.EntryParkingTransactionError),
+) -> Result(a, entry_parking_transaction.EntryParkingTransactionError) {
+  use _ <- result.try(
+    begin_transaction(db)
+    |> result.map_error(entry_parking_transaction.RepositoryFailed),
+  )
+
+  finish_transaction(db, operation())
+}
+
+fn finish_transaction(
+  db: sqlight.Connection,
+  operation: Result(a, entry_parking_transaction.EntryParkingTransactionError),
+) -> Result(a, entry_parking_transaction.EntryParkingTransactionError) {
+  case operation {
+    Ok(value) -> commit_or_rollback(db, value)
+    Error(operation_error) -> rollback_after_failure(db, operation_error)
+  }
+}
+
+fn rollback_after_failure(
+  db: sqlight.Connection,
+  operation_error: entry_parking_transaction.EntryParkingTransactionError,
+) -> Result(a, entry_parking_transaction.EntryParkingTransactionError) {
+  case rollback_transaction(db) {
+    Ok(Nil) -> Error(operation_error)
+
+    Error(rollback_error) ->
+      Error(entry_parking_transaction.RollbackFailed(
+        operation_error: operation_error,
+        rollback_error: rollback_error,
+      ))
+  }
+}
+
+fn commit_or_rollback(
+  db: sqlight.Connection,
+  value: a,
+) -> Result(a, entry_parking_transaction.EntryParkingTransactionError) {
+  case commit_transaction(db) {
+    Ok(Nil) -> Ok(value)
+
+    Error(commit_error) ->
+      rollback_after_failure(
+        db,
+        entry_parking_transaction.RepositoryFailed(commit_error),
+      )
+  }
+}
+
+// MARK: Entry Operation
+
+fn enter_in_transaction(
+  db: sqlight.Connection,
+  request: entry_parking.EntryParkingRequest,
+) -> Result(
+  entry_parking.EntryParkingResult,
+  entry_parking_transaction.EntryParkingTransactionError,
+) {
+  let entry_parking.EntryParkingRequest(vehicle: candidate_vehicle, ..) =
+    request
+
+  use _ <- result.try(
+    persist_vehicle(db, candidate_vehicle)
+    |> result.map_error(entry_parking_transaction.RepositoryFailed),
+  )
+
+  let floor_repository = sqlite_floor_repository.new(db)
+  let session_repository = sqlite_session_repository.new(db)
+
+  use floors <- result.try(
+    sqlite_floor_repository.get_all_floors(floor_repository)
+    |> result.map_error(entry_parking_transaction.RepositoryFailed),
+  )
+
+  use active_sessions <- result.try(
+    sqlite_session_repository.get_active_sessions(session_repository)
+    |> result.map_error(entry_parking_transaction.RepositoryFailed),
+  )
+
+  use entry_result <- result.try(
+    entry_parking.enter_parking(floors, active_sessions, request)
+    |> result.map_error(entry_parking_transaction.EntryFailed),
+  )
+
+  use _ <- result.try(
+    persist_session(db, entry_result.session)
+    |> result.map_error(entry_parking_transaction.RepositoryFailed),
+  )
+
+  use _ <- result.try(
+    persist_ticket(db, entry_result.ticket)
+    |> result.map_error(entry_parking_transaction.RepositoryFailed),
+  )
+
+  Ok(entry_result)
+}
+
+// MARK: Vehicle Persistence
+
+fn persist_vehicle(
+  db: sqlight.Connection,
+  candidate: vehicle.Vehicle,
+) -> Result(Nil, repository_error.RepositoryError) {
+  let vehicle_id =
+    candidate
+    |> vehicle.get_vehicle_id
+    |> vehicle.get_vehicle_id_value
+
+  let plate_number =
+    candidate
+    |> vehicle.get_vehicle_plate_number
+    |> vehicle.get_plate_number_value
+
+  let vehicle_type =
+    candidate
+    |> vehicle.get_vehicle_type
+    |> vehicle_type_to_string
+
+  use _ <- result.try(insert_vehicle_if_missing(
+    db,
+    vehicle_id,
+    plate_number,
+    vehicle_type,
+  ))
+
+  verify_vehicle_identity(db, vehicle_id, plate_number, vehicle_type)
+}
+
+fn insert_vehicle_if_missing(
+  db: sqlight.Connection,
+  vehicle_id: String,
+  plate_number: String,
+  vehicle_type: String,
+) -> Result(Nil, repository_error.RepositoryError) {
+  query_result(sqlight.query(
+    "
+    INSERT INTO vehicles (id, plate_number, vehicle_type)
+    VALUES (?, ?, ?)
+    ON CONFLICT(id) DO NOTHING;
+    ",
+    on: db,
+    with: [
+      sqlight.text(vehicle_id),
+      sqlight.text(plate_number),
+      sqlight.text(vehicle_type),
+    ],
+    expecting: decode.string,
+  ))
+  |> result.map(fn(_) { Nil })
+}
+
+fn verify_vehicle_identity(
+  db: sqlight.Connection,
+  vehicle_id: String,
+  plate_number: String,
+  vehicle_type: String,
+) -> Result(Nil, repository_error.RepositoryError) {
+  case
+    query_result(sqlight.query(
+      "
+    SELECT COUNT(*)
+    FROM vehicles
+    WHERE id = ?
+      AND plate_number = ?
+      AND vehicle_type = ?;
+    ",
+      on: db,
+      with: [
+        sqlight.text(vehicle_id),
+        sqlight.text(plate_number),
+        sqlight.text(vehicle_type),
+      ],
+      expecting: decode.field(0, decode.int, fn(value) { decode.success(value) }),
+    ))
+  {
+    Ok([1]) -> Ok(Nil)
+
+    Ok(_) ->
+      Error(repository_error.StorageError(
+        "Vehicle ID already exists with different vehicle data",
+      ))
+
+    Error(error) -> Error(error)
+  }
+}
+
+fn vehicle_type_to_string(vehicle_type: vehicle.VehicleType) -> String {
+  case vehicle_type {
+    vehicle.Motorcycle -> "Motorcycle"
+    vehicle.Car -> "Car"
+    vehicle.Truck -> "Truck"
+  }
+}
+
+// MARK: Session Persistence
+
+fn persist_session(
+  db: sqlight.Connection,
+  session: parking_session.ParkingSession,
+) -> Result(Nil, repository_error.RepositoryError) {
+  let session_id =
+    session
+    |> parking_session.get_parking_session_id
+    |> parking_session.get_parking_session_id_value
+
+  let vehicle_id =
+    session
+    |> parking_session.get_parking_session_vehicle_id
+    |> vehicle.get_vehicle_id_value
+
+  let slot_id =
+    session
+    |> parking_session.get_parking_session_slot_id
+    |> parking_slot.get_parking_slot_id_value
+
+  let entry_time = parking_session.get_parking_session_entry_time(session)
+
+  query_result(sqlight.query(
+    "
+    INSERT INTO parking_sessions
+      (id, vehicle_id, slot_id, entry_time, exit_time, state)
+    VALUES (?, ?, ?, ?, NULL, 'Active');
+    ",
+    on: db,
+    with: [
+      sqlight.text(session_id),
+      sqlight.text(vehicle_id),
+      sqlight.text(slot_id),
+      sqlight.int(entry_time),
+    ],
+    expecting: decode.string,
+  ))
+  |> result.map(fn(_) { Nil })
+}
+
+// MARK: Ticket Persistence
+
+fn persist_ticket(
+  db: sqlight.Connection,
+  ticket: parking_ticket.ParkingTicket,
+) -> Result(Nil, repository_error.RepositoryError) {
+  let ticket_id =
+    ticket
+    |> parking_ticket.get_parking_ticket_id
+    |> parking_ticket.get_parking_ticket_id_value
+
+  let session_id =
+    ticket
+    |> parking_ticket.get_parking_ticket_session_id
+    |> parking_session.get_parking_session_id_value
+
+  let issued_at = parking_ticket.get_parking_ticket_issued_at(ticket)
+
+  query_result(sqlight.query(
+    "
+    INSERT INTO parking_tickets (id, session_id, issued_at)
+    VALUES (?, ?, ?);
+    ",
+    on: db,
+    with: [
+      sqlight.text(ticket_id),
+      sqlight.text(session_id),
+      sqlight.int(issued_at),
+    ],
+    expecting: decode.string,
+  ))
+  |> result.map(fn(_) { Nil })
+}
+
+// MARK: Transaction Commands
+
+fn begin_transaction(
+  db: sqlight.Connection,
+) -> Result(Nil, repository_error.RepositoryError) {
+  query_result(sqlight.exec("BEGIN IMMEDIATE;", on: db))
+}
+
+fn commit_transaction(
+  db: sqlight.Connection,
+) -> Result(Nil, repository_error.RepositoryError) {
+  query_result(sqlight.exec("COMMIT;", on: db))
+}
+
+fn rollback_transaction(
+  db: sqlight.Connection,
+) -> Result(Nil, repository_error.RepositoryError) {
+  query_result(sqlight.exec("ROLLBACK;", on: db))
+}
+
+// MARK: SQL Error Mapping
+
+fn query_result(
+  value: Result(a, sqlight.Error),
+) -> Result(a, repository_error.RepositoryError) {
+  case value {
+    Ok(value) -> Ok(value)
+
+    Error(sqlight.SqlightError(_, message, _)) ->
+      Error(repository_error.StorageError(message))
+  }
+}
+
+
+============================================================
+FILE: src/infrastructure/sqlite_exit_parking_transaction.gleam
+============================================================
+import application/exit_parking
+import application/ports/exit_parking_transaction
+import application/ports/payment_repository
+import application/ports/repository_error
+import domain/parking_session
+import domain/payment
+import gleam/dynamic/decode
+import gleam/option
+import gleam/result
+import infrastructure/sqlite_payment_repository
+import infrastructure/sqlite_session_repository
+import sqlight
+
+// MARK: SQLite Exit Parking Transaction
+
+pub type SqliteExitParkingTransaction {
+  SqliteExitParkingTransaction(db: sqlight.Connection)
+}
+
+// MARK: Constructor
+
+pub fn new(db: sqlight.Connection) -> SqliteExitParkingTransaction {
+  SqliteExitParkingTransaction(db: db)
+}
+
+// MARK: Port Adapter
+
+pub fn to_port(
+  repository: SqliteExitParkingTransaction,
+) -> exit_parking_transaction.ExitParkingTransaction {
+  exit_parking_transaction.ExitParkingTransaction(exit: fn(request) {
+    exit(repository, request)
+  })
+}
+
+// MARK: Exit Parking
+
+pub fn exit(
+  repository: SqliteExitParkingTransaction,
+  request: exit_parking.ExitParkingRequest,
+) -> Result(
+  exit_parking.ExitParkingResult,
+  exit_parking_transaction.ExitParkingTransactionError,
+) {
+  let SqliteExitParkingTransaction(db: db) = repository
+
+  with_transaction(db, fn() { exit_in_transaction(db, request) })
+}
+
+// MARK: Transaction Lifecycle
+
+fn with_transaction(
+  db: sqlight.Connection,
+  operation: fn() ->
+    Result(a, exit_parking_transaction.ExitParkingTransactionError),
+) -> Result(a, exit_parking_transaction.ExitParkingTransactionError) {
+  use _ <- result.try(
+    begin_transaction(db)
+    |> result.map_error(exit_parking_transaction.RepositoryFailed),
+  )
+
+  finish_transaction(db, operation())
+}
+
+fn finish_transaction(
+  db: sqlight.Connection,
+  operation: Result(a, exit_parking_transaction.ExitParkingTransactionError),
+) -> Result(a, exit_parking_transaction.ExitParkingTransactionError) {
+  case operation {
+    Ok(value) -> commit_or_rollback(db, value)
+    Error(operation_error) -> rollback_after_failure(db, operation_error)
+  }
+}
+
+fn rollback_after_failure(
+  db: sqlight.Connection,
+  operation_error: exit_parking_transaction.ExitParkingTransactionError,
+) -> Result(a, exit_parking_transaction.ExitParkingTransactionError) {
+  case rollback_transaction(db) {
+    Ok(Nil) -> Error(operation_error)
+
+    Error(rollback_error) ->
+      Error(exit_parking_transaction.RollbackFailed(
+        operation_error: operation_error,
+        rollback_error: rollback_error,
+      ))
+  }
+}
+
+fn commit_or_rollback(
+  db: sqlight.Connection,
+  value: a,
+) -> Result(a, exit_parking_transaction.ExitParkingTransactionError) {
+  case commit_transaction(db) {
+    Ok(Nil) -> Ok(value)
+
+    Error(commit_error) ->
+      rollback_after_failure(
+        db,
+        exit_parking_transaction.RepositoryFailed(commit_error),
+      )
+  }
+}
+
+// MARK: Exit Operation
+
+fn exit_in_transaction(
+  db: sqlight.Connection,
+  request: exit_parking.ExitParkingRequest,
+) -> Result(
+  exit_parking.ExitParkingResult,
+  exit_parking_transaction.ExitParkingTransactionError,
+) {
+  let exit_parking.ExitParkingRequest(session_id: session_id, ..) = request
+
+  let session_repository = sqlite_session_repository.new(db)
+
+  use session <- result.try(load_session(session_repository, session_id))
+
+  use exit_result <- result.try(
+    exit_parking.exit_parking(session, request)
+    |> result.map_error(exit_parking_transaction.ExitFailed),
+  )
+
+  use _ <- result.try(
+    persist_payment(db, exit_result.payment)
+    |> result.map_error(exit_parking_transaction.RepositoryFailed),
+  )
+
+  use _ <- result.try(
+    persist_closed_session(db, exit_result.session)
+    |> result.map_error(exit_parking_transaction.RepositoryFailed),
+  )
+
+  Ok(exit_result)
+}
+
+// MARK: Session Loading
+
+fn load_session(
+  repository: sqlite_session_repository.SqliteSessionRepository,
+  session_id: parking_session.ParkingSessionId,
+) -> Result(
+  parking_session.ParkingSession,
+  exit_parking_transaction.ExitParkingTransactionError,
+) {
+  use session <- result.try(
+    sqlite_session_repository.get_session(repository, session_id)
+    |> result.map_error(exit_parking_transaction.RepositoryFailed),
+  )
+
+  case session {
+    option.Some(value) -> Ok(value)
+
+    option.None ->
+      Error(exit_parking_transaction.ExitFailed(exit_parking.SessionNotFound))
+  }
+}
+
+// MARK: Payment Persistence
+
+fn persist_payment(
+  db: sqlight.Connection,
+  payment_option: option.Option(payment.Payment),
+) -> Result(Nil, repository_error.RepositoryError) {
+  case payment_option {
+    option.None -> Ok(Nil)
+
+    option.Some(value) -> {
+      let repository = sqlite_payment_repository.new(db)
+      let payment_repository = sqlite_payment_repository.to_port(repository)
+
+      let payment_repository.PaymentRepository(save_payment: save_payment, ..) =
+        payment_repository
+
+      save_payment(value)
+    }
+  }
+}
+
+// MARK: Session Persistence
+
+fn persist_closed_session(
+  db: sqlight.Connection,
+  session: parking_session.ParkingSession,
+) -> Result(Nil, repository_error.RepositoryError) {
+  let session_id =
+    session
+    |> parking_session.get_parking_session_id
+    |> parking_session.get_parking_session_id_value
+
+  let exit_time = parking_session.get_parking_session_exit_time(session)
+
+  case exit_time {
+    option.None ->
+      Error(repository_error.StorageError(
+        "Cannot persist a closed session without an exit time",
+      ))
+
+    option.Some(value) ->
+      case
+        query_result(sqlight.query(
+          "
+        UPDATE parking_sessions
+        SET
+          exit_time = ?,
+          state = 'Closed'
+        WHERE id = ?
+          AND state = 'Active'
+        RETURNING id;
+        ",
+          on: db,
+          with: [
+            sqlight.int(value),
+            sqlight.text(session_id),
+          ],
+          expecting: decode.field(0, decode.string, fn(id) {
+            decode.success(id)
+          }),
+        ))
+      {
+        Ok([saved_id]) if saved_id == session_id -> Ok(Nil)
+
+        Ok(_) ->
+          Error(repository_error.StorageError(
+            "Failed to persist closed parking session",
+          ))
+
+        Error(error) -> Error(error)
+      }
+  }
+}
+
+// MARK: Transaction Commands
+
+fn begin_transaction(
+  db: sqlight.Connection,
+) -> Result(Nil, repository_error.RepositoryError) {
+  query_result(sqlight.exec("BEGIN IMMEDIATE;", on: db))
+}
+
+fn commit_transaction(
+  db: sqlight.Connection,
+) -> Result(Nil, repository_error.RepositoryError) {
+  query_result(sqlight.exec("COMMIT;", on: db))
+}
+
+fn rollback_transaction(
+  db: sqlight.Connection,
+) -> Result(Nil, repository_error.RepositoryError) {
+  query_result(sqlight.exec("ROLLBACK;", on: db))
+}
+
+// MARK: SQL Error Mapping
+
+fn query_result(
+  value: Result(a, sqlight.Error),
+) -> Result(a, repository_error.RepositoryError) {
+  case value {
+    Ok(value) -> Ok(value)
+
+    Error(sqlight.SqlightError(_, message, _)) ->
+      Error(repository_error.StorageError(message))
+  }
+}
+
+
+============================================================
+FILE: src/infrastructure/sqlite_floor_repository.gleam
+============================================================
+import application/ports/parking_floor_repository
+import application/ports/repository_error
+import domain/floor
+import domain/parking_slot
+import domain/vehicle
+import gleam/dynamic/decode
+import gleam/list
+import gleam/result
+import gleam/string
+import sqlight
+
+pub type SqliteFloorRepository {
+  SqliteFloorRepository(db: sqlight.Connection)
+}
+
+pub fn new(db: sqlight.Connection) -> SqliteFloorRepository {
+  SqliteFloorRepository(db: db)
+}
+
+// -----------------------------------------------------------------------------
+// Transaction
+// -----------------------------------------------------------------------------
+
+fn begin_transaction(
+  db: sqlight.Connection,
+) -> Result(Nil, repository_error.RepositoryError) {
+  query(sqlight.exec("BEGIN IMMEDIATE", on: db))
+}
+
+fn commit_transaction(
+  db: sqlight.Connection,
+) -> Result(Nil, repository_error.RepositoryError) {
+  query(sqlight.exec("COMMIT", on: db))
+}
+
+fn rollback_transaction(db: sqlight.Connection) -> Nil {
+  let _ = sqlight.exec("ROLLBACK", on: db)
+  Nil
+}
+
+// -----------------------------------------------------------------------------
+// Repository write operations
+// -----------------------------------------------------------------------------
+
+fn save_floor(
+  repository: SqliteFloorRepository,
+  parking_floor: floor.ParkingFloor,
+) -> Result(Nil, repository_error.RepositoryError) {
+  let SqliteFloorRepository(db) = repository
+
+  use _ <- result.try(begin_transaction(db))
+
+  case save_floor_data(db, parking_floor) {
+    Ok(Nil) ->
+      case commit_transaction(db) {
+        Ok(Nil) -> Ok(Nil)
+        Error(error) -> {
+          rollback_transaction(db)
+          Error(error)
+        }
+      }
+
+    Error(error) -> {
+      rollback_transaction(db)
+      Error(error)
+    }
+  }
+}
+
+fn save_floor_data(
+  db: sqlight.Connection,
+  parking_floor: floor.ParkingFloor,
+) -> Result(Nil, repository_error.RepositoryError) {
+  use _ <- result.try(insert_floor_if_missing(db, parking_floor))
+
+  save_slots(db, parking_floor, floor.get_parking_floor_slots(parking_floor))
+}
+
+fn insert_floor_if_missing(
+  db: sqlight.Connection,
+  parking_floor: floor.ParkingFloor,
+) -> Result(Nil, repository_error.RepositoryError) {
+  let floor_id =
+    parking_floor
+    |> floor.get_parking_floor_id
+    |> floor.get_parking_floor_id_value
+
+  let sql =
+    "INSERT INTO parking_floors (id) VALUES ('"
+    <> escape_sql(floor_id)
+    <> "') ON CONFLICT(id) DO NOTHING;"
+
+  query(sqlight.exec(sql, on: db))
+}
+
+fn save_slots(
+  db: sqlight.Connection,
+  parking_floor: floor.ParkingFloor,
+  slots: List(parking_slot.ParkingSlot),
+) -> Result(Nil, repository_error.RepositoryError) {
+  let floor_id =
+    parking_floor
+    |> floor.get_parking_floor_id
+    |> floor.get_parking_floor_id_value
+
+  list.fold(slots, Ok(Nil), fn(acc, slot) {
+    use _ <- result.try(acc)
+    save_slot(db, floor_id, slot)
+  })
+}
+
+fn save_slot(
+  db: sqlight.Connection,
+  floor_id: String,
+  slot: parking_slot.ParkingSlot,
+) -> Result(Nil, repository_error.RepositoryError) {
+  let slot_id =
+    slot
+    |> parking_slot.get_parking_slot_id
+    |> parking_slot.get_parking_slot_id_value
+
+  let vehicle_type =
+    slot
+    |> parking_slot.get_supported_vehicle_type
+    |> vehicle_type_to_string
+
+  let sql =
+    "INSERT INTO parking_slots "
+    <> "(id, floor_id, supported_vehicle_type) VALUES ('"
+    <> escape_sql(slot_id)
+    <> "', '"
+    <> escape_sql(floor_id)
+    <> "', '"
+    <> vehicle_type
+    <> "') ON CONFLICT(id) DO NOTHING;"
+
+  use _ <- result.try(query(sqlight.exec(sql, on: db)))
+
+  verify_slot_configuration(db, floor_id, slot_id, vehicle_type)
+}
+
+fn verify_slot_configuration(
+  db: sqlight.Connection,
+  expected_floor_id: String,
+  slot_id: String,
+  expected_vehicle_type: String,
+) -> Result(Nil, repository_error.RepositoryError) {
+  let sql =
+    "SELECT floor_id, supported_vehicle_type "
+    <> "FROM parking_slots WHERE id = '"
+    <> escape_sql(slot_id)
+    <> "';"
+
+  use rows <- result.try(
+    query(sqlight.query(
+      sql,
+      on: db,
+      with: [],
+      expecting: slot_configuration_decoder(),
+    )),
+  )
+
+  case rows {
+    [#(actual_floor_id, actual_vehicle_type)] ->
+      case
+        actual_floor_id == expected_floor_id
+        && actual_vehicle_type == expected_vehicle_type
+      {
+        True -> Ok(Nil)
+
+        False ->
+          Error(repository_error.StorageError(
+            "Parking slot configuration conflict: " <> slot_id,
+          ))
+      }
+
+    _ ->
+      Error(repository_error.StorageError(
+        "Unable to verify parking slot: " <> slot_id,
+      ))
+  }
+}
+
+fn slot_configuration_decoder() {
+  decode.at([0], decode.string)
+  |> decode.then(fn(floor_id) {
+    decode.at([1], decode.string)
+    |> decode.map(fn(vehicle_type) { #(floor_id, vehicle_type) })
+  })
+}
+
+fn vehicle_type_to_string(value: vehicle.VehicleType) -> String {
+  case value {
+    vehicle.Motorcycle -> "Motorcycle"
+    vehicle.Car -> "Car"
+    vehicle.Truck -> "Truck"
+  }
+}
+
+// -----------------------------------------------------------------------------
+// SQL helpers
+// -----------------------------------------------------------------------------
+
+fn escape_sql(value: String) -> String {
+  string.replace(value, "'", "''")
+}
+
+// -----------------------------------------------------------------------------
+// Port adapter
+// -----------------------------------------------------------------------------
+
+pub fn to_port(
+  repository: SqliteFloorRepository,
+) -> parking_floor_repository.ParkingFloorRepository {
+  parking_floor_repository.ParkingFloorRepository(
+    get_all_floors: fn() { get_all_floors(repository) },
+    save_floor: fn(parking_floor) { save_floor(repository, parking_floor) },
+  )
+}
+
+// -----------------------------------------------------------------------------
+// Repository read operations
+// -----------------------------------------------------------------------------
+
+pub fn get_all_floors(
+  repository: SqliteFloorRepository,
+) -> Result(List(floor.ParkingFloor), repository_error.RepositoryError) {
+  let SqliteFloorRepository(db: db) = repository
+
+  use floor_ids <- result.try(load_floor_ids(db))
+  use floors <- result.try(build_floors(floor_ids))
+  use slots <- result.try(load_slot_data(db))
+
+  attach_slots(floors, slots)
+}
+
+// -----------------------------------------------------------------------------
+// Database queries
+// -----------------------------------------------------------------------------
+
+fn load_floor_ids(
+  db: sqlight.Connection,
+) -> Result(List(String), repository_error.RepositoryError) {
+  query(sqlight.query(
+    "
+    SELECT id
+    FROM parking_floors
+    ORDER BY id;
+    ",
+    on: db,
+    with: [],
+    expecting: decode.at([0], decode.string),
+  ))
+}
+
+fn load_slot_data(
+  db: sqlight.Connection,
+) -> Result(List(#(String, String, String)), repository_error.RepositoryError) {
+  query(sqlight.query(
+    "
+    SELECT floor_id, id, supported_vehicle_type
+    FROM parking_slots
+    ORDER BY floor_id, id;
+    ",
+    on: db,
+    with: [],
+    expecting: slot_decoder(),
+  ))
+}
+
+fn slot_decoder() {
+  decode.at([0], decode.string)
+  |> decode.then(fn(floor_id) {
+    decode.at([1], decode.string)
+    |> decode.then(fn(slot_id) {
+      decode.at([2], decode.string)
+      |> decode.map(fn(vehicle_type) { #(floor_id, slot_id, vehicle_type) })
+    })
+  })
+}
+
+// -----------------------------------------------------------------------------
+// Database -> Domain conversion
+// -----------------------------------------------------------------------------
+
+fn build_floors(
+  ids: List(String),
+) -> Result(List(floor.ParkingFloor), repository_error.RepositoryError) {
+  list.fold(ids, Ok([]), fn(acc, id) {
+    use floors <- result.try(acc)
+
+    use floor_id <- result.try(case floor.new_parking_floor_id(id) {
+      Ok(value) -> Ok(value)
+      Error(error) ->
+        Error(repository_error.StorageError(floor.error_message(error)))
+    })
+
+    Ok(list.append(floors, [floor.new_parking_floor(floor_id)]))
+  })
+}
+
+fn build_slot(
+  id: String,
+  vehicle_type: String,
+) -> Result(parking_slot.ParkingSlot, repository_error.RepositoryError) {
+  use slot_id <- result.try(case parking_slot.new_parking_slot_id(id) {
+    Ok(value) -> Ok(value)
+    Error(error) ->
+      Error(repository_error.StorageError(parking_slot.error_message(error)))
+  })
+
+  use supported_vehicle_type <- result.try(parse_vehicle_type(vehicle_type))
+
+  Ok(parking_slot.new_parking_slot(slot_id, supported_vehicle_type))
+}
+
+fn parse_vehicle_type(
+  value: String,
+) -> Result(vehicle.VehicleType, repository_error.RepositoryError) {
+  case value {
+    "Motorcycle" -> Ok(vehicle.Motorcycle)
+    "Car" -> Ok(vehicle.Car)
+    "Truck" -> Ok(vehicle.Truck)
+    _ ->
+      Error(repository_error.StorageError(
+        "Unknown supported vehicle type: " <> value,
+      ))
+  }
+}
+
+// -----------------------------------------------------------------------------
+// Domain aggregation
+// -----------------------------------------------------------------------------
+
+fn attach_slots(
+  floors: List(floor.ParkingFloor),
+  slots: List(#(String, String, String)),
+) -> Result(List(floor.ParkingFloor), repository_error.RepositoryError) {
+  list.fold(slots, Ok(floors), fn(acc, slot_data) {
+    use current_floors <- result.try(acc)
+
+    let #(floor_id, slot_id, vehicle_type) = slot_data
+
+    use slot <- result.try(build_slot(slot_id, vehicle_type))
+
+    add_slot_to_floors(current_floors, floor_id, slot)
+  })
+}
+
+fn floor_id_value(current_floor: floor.ParkingFloor) -> String {
+  current_floor
+  |> floor.get_parking_floor_id
+  |> floor.get_parking_floor_id_value
+}
+
+fn add_slot_to_floors(
+  floors: List(floor.ParkingFloor),
+  floor_id: String,
+  slot: parking_slot.ParkingSlot,
+) -> Result(List(floor.ParkingFloor), repository_error.RepositoryError) {
+  let floor_exists =
+    list.any(floors, fn(current_floor) {
+      floor_id_value(current_floor) == floor_id
+    })
+
+  case floor_exists {
+    False ->
+      Error(repository_error.StorageError(
+        "Parking slot references an unknown floor: " <> floor_id,
+      ))
+
+    True ->
+      floors
+      |> list.map(fn(current_floor) {
+        add_slot_to_matching_floor(current_floor, floor_id, slot)
+      })
+      |> result.all
+  }
+}
+
+fn add_slot_to_matching_floor(
+  current_floor: floor.ParkingFloor,
+  target_floor_id: String,
+  slot: parking_slot.ParkingSlot,
+) -> Result(floor.ParkingFloor, repository_error.RepositoryError) {
+  case floor_id_value(current_floor) == target_floor_id {
+    True ->
+      floor.add_parking_slot(current_floor, slot)
+      |> result.map_error(fn(error) {
+        repository_error.StorageError(floor.error_message(error))
+      })
+
+    False -> Ok(current_floor)
+  }
+}
+
+// -----------------------------------------------------------------------------
+// Error mapping
+// -----------------------------------------------------------------------------
+
+fn query(
+  result: Result(a, sqlight.Error),
+) -> Result(a, repository_error.RepositoryError) {
+  case result {
+    Ok(value) -> Ok(value)
+
+    Error(sqlight.SqlightError(_, message, _)) ->
+      Error(repository_error.StorageError(message))
+  }
+}
+
+
+============================================================
+FILE: src/infrastructure/sqlite_migration.gleam
+============================================================
+import gleam/dynamic/decode
+import gleam/list
+import gleam/result
+
+import migrant
+import sqlight
+
+const required_tables = [
+  "parking_floors",
+  "parking_slots",
+  "vehicles",
+  "parking_sessions",
+  "parking_tickets",
+]
+
+const initial_migration_name = "001_create_parking_schema"
+
+/// Menjalankan migrasi database.
+///
+/// Database baru akan dimigrasikan menggunakan Migrant.
+/// Database lama dengan legacy migration history akan diadopsi
+/// ke Migrant sebelum menjalankan migrasi yang masih pending.
+pub fn migrate(
+  db: sqlight.Connection,
+  migrations_dir: String,
+) -> Result(Nil, String) {
+  use tables <- result.try(load_table_names(db))
+
+  let existing_domain_tables =
+    list.filter(tables, fn(table) { list.contains(required_tables, table) })
+
+  case list.length(existing_domain_tables) {
+    0 -> migrate_new_database(db, tables, migrations_dir)
+
+    5 -> migrate_existing_database(db, tables, migrations_dir)
+
+    _ ->
+      Error(
+        "Schema database tidak lengkap. Migrasi dihentikan untuk mencegah perubahan schema yang tidak aman.",
+      )
+  }
+}
+
+fn migrate_new_database(
+  db: sqlight.Connection,
+  tables: List(String),
+  migrations_dir: String,
+) -> Result(Nil, String) {
+  case list.contains(tables, "schema_migrations") {
+    True ->
+      Error(
+        "Database memiliki schema_migrations tetapi tidak memiliki schema domain. Pemeriksaan manual diperlukan.",
+      )
+
+    False ->
+      case list.contains(tables, "__migrations") {
+        True ->
+          Error(
+            "Database memiliki __migrations tetapi tidak memiliki schema domain. Pemeriksaan manual diperlukan.",
+          )
+
+        False -> run_pending_migrations(db, migrations_dir)
+      }
+  }
+}
+
+fn migrate_existing_database(
+  db: sqlight.Connection,
+  tables: List(String),
+  migrations_dir: String,
+) -> Result(Nil, String) {
+  case list.contains(tables, "__migrations") {
+    True -> {
+      use applied <- result.try(
+        migrant_migration_is_applied(db)
+        |> result.map_error(fn(_) {
+          "Gagal memeriksa migration history Migrant."
+        }),
+      )
+
+      case applied {
+        True -> run_pending_migrations(db, migrations_dir)
+
+        False ->
+          Error(
+            "Schema domain sudah ada tetapi migration history Migrant tidak mencatat migrasi awal.",
+          )
+      }
+    }
+
+    False -> {
+      use _ <- result.try(adopt_legacy_database(db, tables))
+
+      run_pending_migrations(db, migrations_dir)
+    }
+  }
+}
+
+fn adopt_legacy_database(
+  db: sqlight.Connection,
+  tables: List(String),
+) -> Result(Nil, String) {
+  case list.contains(tables, "schema_migrations") {
+    False ->
+      Error(
+        "Schema domain sudah ada tetapi legacy migration history tidak ditemukan.",
+      )
+
+    True -> {
+      use legacy_applied <- result.try(
+        legacy_migration_is_applied(db)
+        |> result.map_error(fn(_) {
+          "Gagal memeriksa legacy migration history."
+        }),
+      )
+
+      case legacy_applied {
+        False ->
+          Error(
+            "Schema domain sudah ada tetapi migrasi awal tidak tercatat pada legacy migration history.",
+          )
+
+        True -> record_migrant_migration(db)
+      }
+    }
+  }
+}
+
+/// Menjalankan seluruh migrasi yang belum tercatat oleh Migrant.
+fn run_pending_migrations(
+  db: sqlight.Connection,
+  migrations_dir: String,
+) -> Result(Nil, String) {
+  migrant.migrate(db, migrations_dir)
+  |> result.map_error(fn(_) {
+    "Gagal menjalankan migrasi database menggunakan Migrant."
+  })
+}
+
+fn load_table_names(db: sqlight.Connection) -> Result(List(String), String) {
+  sqlight.query(
+    "
+    SELECT name
+    FROM sqlite_master
+    WHERE type = 'table'
+      AND name NOT LIKE 'sqlite_%';
+    ",
+    on: db,
+    with: [],
+    expecting: decode.field(0, decode.string, fn(name) { decode.success(name) }),
+  )
+  |> result.map_error(fn(_) { "Gagal membaca daftar tabel database." })
+}
+
+fn legacy_migration_is_applied(
+  db: sqlight.Connection,
+) -> Result(Bool, sqlight.Error) {
+  use versions <- result.try(sqlight.query(
+    "
+    SELECT name
+    FROM schema_migrations
+    WHERE version = 1;
+    ",
+    on: db,
+    with: [],
+    expecting: decode.field(0, decode.string, fn(name) { decode.success(name) }),
+  ))
+
+  Ok(list.contains(versions, "001_create_parking_schema.sql"))
+}
+
+fn migrant_migration_is_applied(
+  db: sqlight.Connection,
+) -> Result(Bool, sqlight.Error) {
+  use names <- result.try(sqlight.query(
+    "
+    SELECT name
+    FROM __migrations
+    WHERE name = ?;
+    ",
+    on: db,
+    with: [sqlight.text(initial_migration_name)],
+    expecting: decode.field(0, decode.string, fn(name) { decode.success(name) }),
+  ))
+
+  Ok(list.contains(names, initial_migration_name))
+}
+
+fn record_migrant_migration(db: sqlight.Connection) -> Result(Nil, String) {
+  case sqlight.exec("BEGIN IMMEDIATE;", on: db) {
+    Error(_) -> Error("Gagal memulai transaksi adopsi migration.")
+
+    Ok(Nil) -> {
+      let outcome = record_migrant_migration_in_transaction(db)
+
+      case outcome {
+        Ok(Nil) ->
+          case sqlight.exec("COMMIT;", on: db) {
+            Ok(Nil) -> Ok(Nil)
+
+            Error(_) -> {
+              rollback_migration_adoption(db)
+              Error("Gagal melakukan commit adopsi migration.")
+            }
+          }
+
+        Error(message) -> {
+          rollback_migration_adoption(db)
+          Error(message)
+        }
+      }
+    }
+  }
+}
+
+fn record_migrant_migration_in_transaction(
+  db: sqlight.Connection,
+) -> Result(Nil, String) {
+  use _ <- result.try(
+    sqlight.exec(
+      "
+      CREATE TABLE IF NOT EXISTS __migrations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      );
+      ",
+      on: db,
+    )
+    |> result.map_error(fn(_) {
+      "Gagal membuat tabel migration history Migrant."
+    }),
+  )
+
+  use _ <- result.try(
+    sqlight.exec(
+      "
+      INSERT INTO __migrations (name)
+      SELECT '001_create_parking_schema'
+      WHERE NOT EXISTS (
+        SELECT 1
+        FROM __migrations
+        WHERE name = '001_create_parking_schema'
+      );
+      ",
+      on: db,
+    )
+    |> result.map_error(fn(_) {
+      "Gagal mengadopsi legacy migration ke Migrant."
+    }),
+  )
+
+  Ok(Nil)
+}
+
+fn rollback_migration_adoption(db: sqlight.Connection) {
+  let _ = sqlight.exec("ROLLBACK;", on: db)
+
+  Nil
+}
+
+
+============================================================
+FILE: src/infrastructure/sqlite_payment_repository.gleam
+============================================================
+import application/ports/payment_repository
+import application/ports/repository_error
+import domain/parking_session
+import domain/payment
+import gleam/dynamic/decode
+import gleam/option
+import gleam/result
+import sqlight
+
+pub type SqlitePaymentRepository {
+  SqlitePaymentRepository(db: sqlight.Connection)
+}
+
+pub fn new(db: sqlight.Connection) -> SqlitePaymentRepository {
+  SqlitePaymentRepository(db: db)
+}
+
+pub fn to_port(
+  repository: SqlitePaymentRepository,
+) -> payment_repository.PaymentRepository {
+  payment_repository.PaymentRepository(
+    get_payment: fn(id) { get_payment(repository, id) },
+    save_payment: fn(value) { save_payment(repository, value) },
+  )
+}
+
+// ----------------------------------------------------------------------------
+// Repository
+// ----------------------------------------------------------------------------
+
+pub fn get_payment(
+  repository: SqlitePaymentRepository,
+  id: payment.PaymentId,
+) -> Result(option.Option(payment.Payment), repository_error.RepositoryError) {
+  let SqlitePaymentRepository(db: db) = repository
+
+  use payment_data <- result.try(load_payment(db, id))
+
+  case payment_data {
+    [] -> Ok(option.None)
+
+    [data] -> {
+      use value <- result.try(build_payment_from_data(data))
+      Ok(option.Some(value))
+    }
+
+    [_, _, ..] ->
+      Error(repository_error.StorageError(
+        "Multiple payments found for one payment ID",
+      ))
+  }
+}
+
+pub fn save_payment(
+  repository: SqlitePaymentRepository,
+  value: payment.Payment,
+) -> Result(Nil, repository_error.RepositoryError) {
+  let SqlitePaymentRepository(db: db) = repository
+
+  let payment_id = payment.get_payment_id_value(payment.get_payment_id(value))
+
+  let session_id =
+    parking_session.get_parking_session_id_value(payment.get_payment_session_id(
+      value,
+    ))
+
+  let amount = payment.get_payment_amount(value)
+  let method = payment.get_payment_method(value)
+  let status = payment.get_payment_status(value)
+  let created_at = payment.get_payment_created_at(value)
+
+  use method_value <- result.try(payment_method_to_string(method))
+  use status_value <- result.try(payment_status_to_string(status))
+
+  use saved_ids <- result.try(
+    query(sqlight.query(
+      "
+    INSERT INTO payments (
+      id,
+      session_id,
+      amount,
+      method,
+      status,
+      created_at
+    )
+    VALUES (?, ?, ?, ?, ?, ?)
+    ON CONFLICT(id) DO UPDATE SET
+      session_id = excluded.session_id,
+      amount = excluded.amount,
+      method = excluded.method,
+      status = excluded.status,
+      created_at = excluded.created_at
+    RETURNING id;
+    ",
+      on: db,
+      with: [
+        sqlight.text(payment_id),
+        sqlight.text(session_id),
+        sqlight.int(amount),
+        sqlight.text(method_value),
+        sqlight.text(status_value),
+        sqlight.int(created_at),
+      ],
+      expecting: decode.field(0, decode.string, fn(id) { decode.success(id) }),
+    )),
+  )
+
+  case saved_ids {
+    [saved_id] if saved_id == payment_id -> Ok(Nil)
+
+    _ -> Error(repository_error.StorageError("Failed to persist payment"))
+  }
+}
+
+// ----------------------------------------------------------------------------
+// Database queries
+// ----------------------------------------------------------------------------
+
+fn load_payment(
+  db: sqlight.Connection,
+  id: payment.PaymentId,
+) -> Result(
+  List(#(String, String, Int, String, String, Int)),
+  repository_error.RepositoryError,
+) {
+  query(sqlight.query(
+    "
+    SELECT
+      id,
+      session_id,
+      amount,
+      method,
+      status,
+      created_at
+    FROM payments
+    WHERE id = ?;
+    ",
+    on: db,
+    with: [
+      sqlight.text(payment.get_payment_id_value(id)),
+    ],
+    expecting: payment_decoder(),
+  ))
+}
+
+fn payment_decoder() {
+  decode.at([0], decode.string)
+  |> decode.then(fn(payment_id) {
+    decode.at([1], decode.string)
+    |> decode.then(fn(session_id) {
+      decode.at([2], decode.int)
+      |> decode.then(fn(amount) {
+        decode.at([3], decode.string)
+        |> decode.then(fn(method) {
+          decode.at([4], decode.string)
+          |> decode.then(fn(status) {
+            decode.at([5], decode.int)
+            |> decode.map(fn(created_at) {
+              #(payment_id, session_id, amount, method, status, created_at)
+            })
+          })
+        })
+      })
+    })
+  })
+}
+
+// ----------------------------------------------------------------------------
+// Database -> Domain conversion
+// ----------------------------------------------------------------------------
+
+fn build_payment_from_data(
+  data: #(String, String, Int, String, String, Int),
+) -> Result(payment.Payment, repository_error.RepositoryError) {
+  let #(payment_id, session_id, amount, method, status, created_at) = data
+
+  use id <- result.try(build_payment_id(payment_id))
+  use session_id <- result.try(build_session_id(session_id))
+  use method <- result.try(payment_method_from_string(method))
+
+  use value <- result.try(
+    case payment.new_payment(id, session_id, amount, method, created_at) {
+      Ok(value) -> Ok(value)
+
+      Error(error) ->
+        Error(repository_error.StorageError(payment.error_message(error)))
+    },
+  )
+
+  apply_payment_status(value, status)
+}
+
+fn build_payment_id(
+  value: String,
+) -> Result(payment.PaymentId, repository_error.RepositoryError) {
+  case payment.new_payment_id(value) {
+    Ok(id) -> Ok(id)
+
+    Error(error) ->
+      Error(repository_error.StorageError(payment.error_message(error)))
+  }
+}
+
+fn build_session_id(
+  value: String,
+) -> Result(parking_session.ParkingSessionId, repository_error.RepositoryError) {
+  case parking_session.new_parking_session_id(value) {
+    Ok(id) -> Ok(id)
+
+    Error(error) ->
+      Error(repository_error.StorageError(parking_session.error_message(error)))
+  }
+}
+
+fn apply_payment_status(
+  value: payment.Payment,
+  status: String,
+) -> Result(payment.Payment, repository_error.RepositoryError) {
+  case status {
+    "Pending" -> Ok(value)
+
+    "Succeeded" ->
+      case payment.succeed_payment(value) {
+        Ok(updated) -> Ok(updated)
+
+        Error(error) ->
+          Error(repository_error.StorageError(payment.error_message(error)))
+      }
+
+    "Failed" ->
+      case payment.fail_payment(value) {
+        Ok(updated) -> Ok(updated)
+
+        Error(error) ->
+          Error(repository_error.StorageError(payment.error_message(error)))
+      }
+
+    "Cancelled" ->
+      case payment.cancel_payment(value) {
+        Ok(updated) -> Ok(updated)
+
+        Error(error) ->
+          Error(repository_error.StorageError(payment.error_message(error)))
+      }
+
+    _ ->
+      Error(repository_error.StorageError("Invalid payment status in database"))
+  }
+}
+
+// ----------------------------------------------------------------------------
+// Enum conversion
+// ----------------------------------------------------------------------------
+
+fn payment_method_to_string(
+  method: payment.PaymentMethod,
+) -> Result(String, repository_error.RepositoryError) {
+  case method {
+    payment.Cash -> Ok("Cash")
+    payment.Qris -> Ok("Qris")
+    payment.DebitCard -> Ok("DebitCard")
+    payment.EWallet -> Ok("EWallet")
+  }
+}
+
+fn payment_method_from_string(
+  value: String,
+) -> Result(payment.PaymentMethod, repository_error.RepositoryError) {
+  case value {
+    "Cash" -> Ok(payment.Cash)
+    "Qris" -> Ok(payment.Qris)
+    "DebitCard" -> Ok(payment.DebitCard)
+    "EWallet" -> Ok(payment.EWallet)
+
+    _ ->
+      Error(repository_error.StorageError("Invalid payment method in database"))
+  }
+}
+
+fn payment_status_to_string(
+  status: payment.PaymentStatus,
+) -> Result(String, repository_error.RepositoryError) {
+  case status {
+    payment.Pending -> Ok("Pending")
+    payment.Succeeded -> Ok("Succeeded")
+    payment.Failed -> Ok("Failed")
+    payment.Cancelled -> Ok("Cancelled")
+  }
+}
+
+// ----------------------------------------------------------------------------
+// Error mapping
+// ----------------------------------------------------------------------------
+
+fn query(
+  value: Result(a, sqlight.Error),
+) -> Result(a, repository_error.RepositoryError) {
+  case value {
+    Ok(result) -> Ok(result)
+
+    Error(sqlight.SqlightError(_, message, _)) ->
+      Error(repository_error.StorageError(message))
+  }
+}
+
+
+============================================================
+FILE: src/infrastructure/sqlite_session_repository.gleam
+============================================================
+import application/ports/parking_session_repository
+import application/ports/repository_error
+import domain/parking_session
+import domain/parking_slot
+import domain/vehicle
+import gleam/dynamic/decode
+import gleam/list
+import gleam/option
+import gleam/result
+import sqlight
+
+pub type SqliteSessionRepository {
+  SqliteSessionRepository(db: sqlight.Connection)
+}
+
+pub fn new(db: sqlight.Connection) -> SqliteSessionRepository {
+  SqliteSessionRepository(db: db)
+}
+
+pub fn to_port(
+  repository: SqliteSessionRepository,
+) -> parking_session_repository.ParkingSessionRepository {
+  parking_session_repository.ParkingSessionRepository(
+    get_active_sessions: fn() { get_active_sessions(repository) },
+    get_session: fn(id) { get_session(repository, id) },
+  )
+}
+
+// -----------------------------------------------------------------------------
+// Repository
+// -----------------------------------------------------------------------------
+
+pub fn get_active_sessions(
+  repository: SqliteSessionRepository,
+) -> Result(
+  List(parking_session.ParkingSession),
+  repository_error.RepositoryError,
+) {
+  let SqliteSessionRepository(db: db) = repository
+
+  use session_data <- result.try(load_active_sessions(db))
+
+  build_sessions(session_data)
+}
+
+pub fn get_session(
+  repository: SqliteSessionRepository,
+  id: parking_session.ParkingSessionId,
+) -> Result(
+  option.Option(parking_session.ParkingSession),
+  repository_error.RepositoryError,
+) {
+  let SqliteSessionRepository(db: db) = repository
+
+  use session_data <- result.try(load_session(db, id))
+
+  case session_data {
+    [] -> Ok(option.None)
+
+    [data] -> {
+      use session <- result.try(build_session_from_data(data))
+      Ok(option.Some(session))
+    }
+
+    [_, _, ..] ->
+      Error(repository_error.StorageError(
+        "Multiple parking sessions found for one session ID",
+      ))
+  }
+}
+
+// -----------------------------------------------------------------------------
+// Database queries
+// -----------------------------------------------------------------------------
+
+fn load_active_sessions(
+  db: sqlight.Connection,
+) -> Result(
+  List(#(String, String, String, Int)),
+  repository_error.RepositoryError,
+) {
+  query(sqlight.query(
+    "
+    SELECT
+      id,
+      vehicle_id,
+      slot_id,
+      entry_time
+    FROM parking_sessions
+    WHERE state = 'Active'
+    ORDER BY entry_time, id;
+    ",
+    on: db,
+    with: [],
+    expecting: active_session_decoder(),
+  ))
+}
+
+fn load_session(
+  db: sqlight.Connection,
+  id: parking_session.ParkingSessionId,
+) -> Result(
+  List(#(String, String, String, Int, String, Int)),
+  repository_error.RepositoryError,
+) {
+  query(sqlight.query(
+    "
+    SELECT
+      id,
+      vehicle_id,
+      slot_id,
+      entry_time,
+      state,
+      COALESCE(exit_time, -1)
+    FROM parking_sessions
+    WHERE id = ?;
+    ",
+    on: db,
+    with: [
+      sqlight.text(parking_session.get_parking_session_id_value(id)),
+    ],
+    expecting: session_decoder(),
+  ))
+}
+
+fn active_session_decoder() {
+  decode.at([0], decode.string)
+  |> decode.then(fn(session_id) {
+    decode.at([1], decode.string)
+    |> decode.then(fn(vehicle_id) {
+      decode.at([2], decode.string)
+      |> decode.then(fn(slot_id) {
+        decode.at([3], decode.int)
+        |> decode.map(fn(entry_time) {
+          #(session_id, vehicle_id, slot_id, entry_time)
+        })
+      })
+    })
+  })
+}
+
+fn session_decoder() {
+  decode.at([0], decode.string)
+  |> decode.then(fn(session_id) {
+    decode.at([1], decode.string)
+    |> decode.then(fn(vehicle_id) {
+      decode.at([2], decode.string)
+      |> decode.then(fn(slot_id) {
+        decode.at([3], decode.int)
+        |> decode.then(fn(entry_time) {
+          decode.at([4], decode.string)
+          |> decode.then(fn(state) {
+            decode.at([5], decode.int)
+            |> decode.map(fn(exit_time) {
+              #(session_id, vehicle_id, slot_id, entry_time, state, exit_time)
+            })
+          })
+        })
+      })
+    })
+  })
+}
+
+// -----------------------------------------------------------------------------
+// Database -> Domain conversion
+// -----------------------------------------------------------------------------
+
+fn build_sessions(
+  session_data: List(#(String, String, String, Int)),
+) -> Result(
+  List(parking_session.ParkingSession),
+  repository_error.RepositoryError,
+) {
+  list.fold(session_data, Ok([]), fn(acc, data) {
+    use sessions <- result.try(acc)
+    use session <- result.try(build_active_session_from_data(data))
+
+    Ok(list.append(sessions, [session]))
+  })
+}
+
+fn build_active_session_from_data(
+  data: #(String, String, String, Int),
+) -> Result(parking_session.ParkingSession, repository_error.RepositoryError) {
+  let #(session_id, vehicle_id, slot_id, entry_time) = data
+
+  build_session(session_id, vehicle_id, slot_id, entry_time)
+}
+
+fn build_session_from_data(
+  data: #(String, String, String, Int, String, Int),
+) -> Result(parking_session.ParkingSession, repository_error.RepositoryError) {
+  let #(session_id, vehicle_id, slot_id, entry_time, state, exit_time) = data
+
+  use session <- result.try(build_session(
+    session_id,
+    vehicle_id,
+    slot_id,
+    entry_time,
+  ))
+
+  case state {
+    "Active" if exit_time == -1 -> Ok(session)
+
+    "Closed" if exit_time >= 0 ->
+      case parking_session.close_parking_session(session, exit_time) {
+        Ok(closed_session) -> Ok(closed_session)
+
+        Error(error) ->
+          Error(
+            repository_error.StorageError(parking_session.error_message(error)),
+          )
+      }
+
+    _ ->
+      Error(repository_error.StorageError(
+        "Invalid parking session state or exit time in database",
+      ))
+  }
+}
+
+fn build_session(
+  session_id: String,
+  vehicle_id: String,
+  slot_id: String,
+  entry_time: Int,
+) -> Result(parking_session.ParkingSession, repository_error.RepositoryError) {
+  use id <- result.try(case parking_session.new_parking_session_id(session_id) {
+    Ok(value) -> Ok(value)
+    Error(error) ->
+      Error(repository_error.StorageError(parking_session.error_message(error)))
+  })
+
+  use vehicle_id <- result.try(case vehicle.new_vehicle_id(vehicle_id) {
+    Ok(value) -> Ok(value)
+    Error(error) ->
+      Error(repository_error.StorageError(vehicle.error_message(error)))
+  })
+
+  use slot_id <- result.try(case parking_slot.new_parking_slot_id(slot_id) {
+    Ok(value) -> Ok(value)
+    Error(error) ->
+      Error(repository_error.StorageError(parking_slot.error_message(error)))
+  })
+
+  case
+    parking_session.new_parking_session(id, vehicle_id, slot_id, entry_time)
+  {
+    Ok(session) -> Ok(session)
+
+    Error(error) ->
+      Error(repository_error.StorageError(parking_session.error_message(error)))
+  }
+}
+
+// -----------------------------------------------------------------------------
+// Error mapping
+// -----------------------------------------------------------------------------
+
+fn query(
+  result: Result(a, sqlight.Error),
+) -> Result(a, repository_error.RepositoryError) {
+  case result {
+    Ok(value) -> Ok(value)
+
+    Error(sqlight.SqlightError(_, message, _)) ->
+      Error(repository_error.StorageError(message))
+  }
+}
+
+
+============================================================
+FILE: src/parking_lot.gleam
+============================================================
+import application/ports/repository_error
+import application/seed_parking_layout
+import domain/floor
+import domain/parking_slot
+import gleam/io
+import infrastructure/sqlite_database
+import infrastructure/sqlite_floor_repository
+
+pub fn main() -> Nil {
+  case sqlite_database.connect() {
+    Ok(db) -> {
+      let floor_repository =
+        sqlite_floor_repository.new(db)
+        |> sqlite_floor_repository.to_port
+
+      case seed_parking_layout.seed(floor_repository) {
+        Ok(Nil) -> io.println("Parking layout seeded successfully")
+
+        Error(error) ->
+          io.println(
+            "Parking layout seeding failed: " <> seed_error_message(error),
+          )
+      }
+    }
+
+    Error(repository_error.StorageError(message)) ->
+      io.println("Database initialization failed: " <> message)
+  }
+}
+
+fn seed_error_message(
+  error: seed_parking_layout.SeedParkingLayoutError,
+) -> String {
+  case error {
+    seed_parking_layout.InvalidFloorId(domain_error) ->
+      "Invalid floor ID: " <> floor.error_message(domain_error)
+
+    seed_parking_layout.InvalidSlotId(domain_error) ->
+      "Invalid slot ID: " <> parking_slot.error_message(domain_error)
+
+    seed_parking_layout.FloorConfigurationFailed(domain_error) ->
+      "Floor configuration failed: " <> floor.error_message(domain_error)
+
+    seed_parking_layout.RepositoryFailed(repository_error.StorageError(message)) ->
+      "Repository failed: " <> message
+  }
+}
+
+
+============================================================
+FILE: test/application/entry_parking_service_test.gleam
+============================================================
+import application/entry_parking
+import application/entry_parking_service
+import application/ports/entry_parking_transaction
+import application/ports/repository_error
+import domain/floor
+import domain/parking_session
+import domain/parking_slot
+import domain/parking_ticket
+import domain/vehicle
+import gleeunit/should
+
+// MARK: Test Helpers
+
+fn make_vehicle(
+  id: String,
+  vehicle_type: vehicle.VehicleType,
+) -> vehicle.Vehicle {
+  let assert Ok(vehicle_id) = vehicle.new_vehicle_id(id)
+  let assert Ok(plate_number) = vehicle.new_plate_number("B 1234 ABC")
+  vehicle.new_vehicle(vehicle_id, plate_number, vehicle_type)
+}
+
+fn make_slot(
+  id: String,
+  supported_type: vehicle.VehicleType,
+) -> parking_slot.ParkingSlot {
+  let assert Ok(slot_id) = parking_slot.new_parking_slot_id(id)
+  parking_slot.new_parking_slot(slot_id, supported_type)
+}
+
+fn make_floor(
+  id: String,
+  slots: List(parking_slot.ParkingSlot),
+) -> floor.ParkingFloor {
+  let assert Ok(floor_id) = floor.new_parking_floor_id(id)
+  let initial_floor = floor.new_parking_floor(floor_id)
+  add_slots(initial_floor, slots)
+}
+
+fn add_slots(
+  current_floor: floor.ParkingFloor,
+  slots: List(parking_slot.ParkingSlot),
+) -> floor.ParkingFloor {
+  case slots {
+    [] -> current_floor
+    [slot, ..remaining] -> {
+      let assert Ok(updated_floor) = floor.add_parking_slot(current_floor, slot)
+      add_slots(updated_floor, remaining)
+    }
+  }
+}
+
+fn make_session_id(id: String) -> parking_session.ParkingSessionId {
+  let assert Ok(session_id) = parking_session.new_parking_session_id(id)
+  session_id
+}
+
+fn make_ticket_id(id: String) -> parking_ticket.ParkingTicketId {
+  let assert Ok(ticket_id) = parking_ticket.new_parking_ticket_id(id)
+  ticket_id
+}
+
+fn make_request(
+  session_id: String,
+  ticket_id: String,
+  candidate_vehicle: vehicle.Vehicle,
+  entry_time: Int,
+) -> entry_parking.EntryParkingRequest {
+  entry_parking.EntryParkingRequest(
+    session_id: make_session_id(session_id),
+    ticket_id: make_ticket_id(ticket_id),
+    vehicle: candidate_vehicle,
+    entry_time: entry_time,
+  )
+}
+
+fn make_service(
+  floors: List(floor.ParkingFloor),
+  sessions: List(parking_session.ParkingSession),
+) -> entry_parking_service.EntryParkingService {
+  let transaction =
+    entry_parking_transaction.EntryParkingTransaction(enter: fn(request) {
+      case entry_parking.enter_parking(floors, sessions, request) {
+        Ok(entry_result) -> Ok(entry_result)
+        Error(error) -> Error(entry_parking_transaction.EntryFailed(error))
+      }
+    })
+
+  entry_parking_service.new(transaction)
+}
+
+fn make_storage_error() -> repository_error.RepositoryError {
+  repository_error.StorageError("database unavailable")
+}
+
+fn make_failing_service(
+  error: entry_parking_transaction.EntryParkingTransactionError,
+) -> entry_parking_service.EntryParkingService {
+  let transaction =
+    entry_parking_transaction.EntryParkingTransaction(enter: fn(_) {
+      Error(error)
+    })
+
+  entry_parking_service.new(transaction)
+}
+
+// MARK: Successful Entry
+
+pub fn entry_succeeds_and_returns_entry_result_test() {
+  let car = make_vehicle("VEHICLE-001", vehicle.Car)
+  let slot = make_slot("SLOT-001", vehicle.Car)
+  let parking_floor = make_floor("FLOOR-001", [slot])
+
+  let service = make_service([parking_floor], [])
+  let request = make_request("SESSION-001", "TICKET-001", car, 1000)
+
+  let result = entry_parking_service.enter(service, request)
+
+  case result {
+    Ok(entry_result) -> {
+      parking_slot.get_parking_slot_id(entry_result.slot)
+      |> parking_slot.get_parking_slot_id_value
+      |> should.equal("SLOT-001")
+
+      parking_session.get_parking_session_state(entry_result.session)
+      |> should.equal(parking_session.Active)
+
+      parking_ticket.get_parking_ticket_issued_at(entry_result.ticket)
+      |> should.equal(1000)
+
+      parking_ticket.get_parking_ticket_session_id(entry_result.ticket)
+      |> should.equal(make_session_id("SESSION-001"))
+    }
+    Error(_) -> should.fail()
+  }
+}
+
+// MARK: Domain Failure
+
+pub fn entry_fails_when_no_parking_slot_is_available_test() {
+  let service = make_service([], [])
+
+  let request =
+    make_request(
+      "SESSION-001",
+      "TICKET-001",
+      make_vehicle("VEHICLE-001", vehicle.Car),
+      1000,
+    )
+
+  entry_parking_service.enter(service, request)
+  |> should.equal(
+    Error(entry_parking_service.EntryFailed(
+      entry_parking.NoAvailableParkingSlot,
+    )),
+  )
+}
+
+// MARK: Repository Failure
+
+pub fn entry_fails_when_transaction_repository_fails_test() {
+  let service =
+    make_failing_service(
+      entry_parking_transaction.RepositoryFailed(make_storage_error()),
+    )
+
+  let request =
+    make_request(
+      "SESSION-001",
+      "TICKET-001",
+      make_vehicle("VEHICLE-001", vehicle.Car),
+      1000,
+    )
+
+  entry_parking_service.enter(service, request)
+  |> should.equal(
+    Error(entry_parking_service.TransactionFailed(make_storage_error())),
+  )
+}
+
+// MARK: Transaction Domain Failure
+
+pub fn entry_fails_when_transaction_returns_domain_error_test() {
+  let service =
+    make_failing_service(entry_parking_transaction.EntryFailed(
+      entry_parking.NoAvailableParkingSlot,
+    ))
+
+  let request =
+    make_request(
+      "SESSION-001",
+      "TICKET-001",
+      make_vehicle("VEHICLE-001", vehicle.Car),
+      1000,
+    )
+
+  entry_parking_service.enter(service, request)
+  |> should.equal(
+    Error(entry_parking_service.EntryFailed(
+      entry_parking.NoAvailableParkingSlot,
+    )),
+  )
+}
+
+
+============================================================
+FILE: test/application/exit_parking_test.gleam
+============================================================
+import application/exit_parking
+import domain/parking_fee
+import domain/parking_session
+import domain/parking_slot
+import domain/payment
+import domain/vehicle
+import gleam/option.{None, Some}
+import gleeunit/should
+
+// MARK: Test Helpers
+
+fn make_parking_session() -> parking_session.ParkingSession {
+  let assert Ok(session_id) =
+    parking_session.new_parking_session_id("SESSION-001")
+
+  let assert Ok(vehicle_id) = vehicle.new_vehicle_id("VEHICLE-001")
+
+  let assert Ok(slot_id) = parking_slot.new_parking_slot_id("SLOT-001")
+
+  let assert Ok(session) =
+    parking_session.new_parking_session(session_id, vehicle_id, slot_id, 1000)
+
+  session
+}
+
+fn make_payment_id() -> payment.PaymentId {
+  let assert Ok(id) = payment.new_payment_id("PAYMENT-001")
+  id
+}
+
+fn make_request(
+  session: parking_session.ParkingSession,
+  payment_id: option.Option(payment.PaymentId),
+  exit_time: Int,
+  hourly_rate: Int,
+) -> exit_parking.ExitParkingRequest {
+  exit_parking.ExitParkingRequest(
+    session_id: parking_session.get_parking_session_id(session),
+    payment_id: payment_id,
+    exit_time: exit_time,
+    hourly_rate: hourly_rate,
+    payment_method: payment.Cash,
+  )
+}
+
+// MARK: Zero Fee
+
+pub fn zero_fee_closes_session_without_payment_test() {
+  let session = make_parking_session()
+  let request = make_request(session, None, 1000, 5000)
+
+  let assert Ok(result) = exit_parking.exit_parking(session, request)
+
+  should.equal(result.fee, 0)
+  should.equal(result.duration_seconds, 0)
+  should.equal(result.payment, None)
+  should.equal(
+    parking_session.get_parking_session_state(result.session),
+    parking_session.Closed(1000),
+  )
+}
+
+pub fn zero_fee_does_not_require_payment_id_test() {
+  let session = make_parking_session()
+  let request = make_request(session, None, 1000, 5000)
+
+  should.be_ok(exit_parking.exit_parking(session, request))
+}
+
+// MARK: Successful Payment
+
+pub fn positive_fee_creates_succeeded_payment_test() {
+  let session = make_parking_session()
+  let request = make_request(session, Some(make_payment_id()), 4600, 5000)
+
+  let assert Ok(result) = exit_parking.exit_parking(session, request)
+
+  should.equal(result.duration_seconds, 3600)
+  should.equal(result.fee, 5000)
+
+  case result.payment {
+    None -> should.fail()
+    Some(settled_payment) -> {
+      should.equal(
+        payment.get_payment_status(settled_payment),
+        payment.Succeeded,
+      )
+      should.equal(payment.get_payment_amount(settled_payment), 5000)
+      should.equal(payment.get_payment_method(settled_payment), payment.Cash)
+    }
+  }
+
+  should.equal(
+    parking_session.get_parking_session_state(result.session),
+    parking_session.Closed(4600),
+  )
+}
+
+pub fn positive_fee_requires_payment_id_test() {
+  let session = make_parking_session()
+  let request = make_request(session, None, 4600, 5000)
+
+  should.equal(
+    exit_parking.exit_parking(session, request),
+    Error(exit_parking.MissingPaymentId),
+  )
+}
+
+// MARK: Session Validation
+
+pub fn closed_session_cannot_exit_again_test() {
+  let session = make_parking_session()
+
+  let assert Ok(closed_session) =
+    parking_session.close_parking_session(session, 2000)
+
+  let request =
+    make_request(closed_session, Some(make_payment_id()), 3000, 5000)
+
+  should.equal(
+    exit_parking.exit_parking(closed_session, request),
+    Error(exit_parking.SessionClosingFailed(
+      parking_session.ParkingSessionAlreadyClosed,
+    )),
+  )
+}
+
+pub fn exit_before_entry_is_rejected_test() {
+  let session = make_parking_session()
+  let request = make_request(session, Some(make_payment_id()), 999, 5000)
+
+  should.equal(
+    exit_parking.exit_parking(session, request),
+    Error(exit_parking.SessionClosingFailed(parking_session.InvalidExitTime)),
+  )
+}
+
+// MARK: Fee Validation
+
+pub fn invalid_hourly_rate_is_rejected_test() {
+  let session = make_parking_session()
+  let request = make_request(session, None, 2000, 0)
+
+  should.equal(
+    exit_parking.exit_parking(session, request),
+    Error(exit_parking.FeeCalculationFailed(parking_fee.InvalidHourlyRate)),
+  )
+}
+
+// MARK: Immutability
+
+pub fn failed_exit_does_not_mutate_original_session_test() {
+  let session = make_parking_session()
+  let request = make_request(session, None, 4600, 5000)
+
+  let assert Error(_) = exit_parking.exit_parking(session, request)
+
+  should.equal(
+    parking_session.get_parking_session_state(session),
+    parking_session.Active,
+  )
+}
+
+
+============================================================
+FILE: test/domain/floor_test.gleam
+============================================================
+import domain/floor
+import domain/parking_slot
+import domain/vehicle
+import gleeunit/should
+
+// MARK: Test Helpers
+
+fn make_floor() -> floor.ParkingFloor {
+  let assert Ok(floor_id) = floor.new_parking_floor_id("FLOOR-01")
+  floor.new_parking_floor(floor_id)
+}
+
+fn make_slot(id: String) -> parking_slot.ParkingSlot {
+  let assert Ok(slot_id) = parking_slot.new_parking_slot_id(id)
+  parking_slot.new_parking_slot(slot_id, vehicle.Car)
+}
+
+// MARK: Parking Floor ID
+
+pub fn floor_id_rejects_empty_value_test() {
+  should.equal(floor.new_parking_floor_id(""), Error(floor.EmptyParkingFloorId))
+}
+
+pub fn floor_id_rejects_whitespace_test() {
+  should.equal(
+    floor.new_parking_floor_id("   "),
+    Error(floor.EmptyParkingFloorId),
+  )
+}
+
+pub fn floor_id_trims_whitespace_test() {
+  let assert Ok(id) = floor.new_parking_floor_id("  FLOOR-01  ")
+
+  should.equal(floor.get_parking_floor_id_value(id), "FLOOR-01")
+}
+
+// MARK: Parking Floor
+
+pub fn new_floor_starts_without_slots_test() {
+  let new_floor = make_floor()
+
+  should.equal(floor.get_parking_floor_slot_count(new_floor), 0)
+}
+
+pub fn floor_exposes_its_id_test() {
+  let new_floor = make_floor()
+
+  floor.get_parking_floor_id(new_floor)
+  |> floor.get_parking_floor_id_value
+  |> should.equal("FLOOR-01")
+}
+
+pub fn floor_can_add_a_slot_test() {
+  let new_floor = make_floor()
+  let slot = make_slot("SLOT-01")
+
+  let assert Ok(updated_floor) = floor.add_parking_slot(new_floor, slot)
+
+  should.equal(floor.get_parking_floor_slot_count(updated_floor), 1)
+}
+
+pub fn floor_can_add_multiple_slots_test() {
+  let new_floor = make_floor()
+  let first_slot = make_slot("SLOT-01")
+  let second_slot = make_slot("SLOT-02")
+
+  let assert Ok(floor_with_first_slot) =
+    floor.add_parking_slot(new_floor, first_slot)
+
+  let assert Ok(floor_with_two_slots) =
+    floor.add_parking_slot(floor_with_first_slot, second_slot)
+
+  should.equal(floor.get_parking_floor_slot_count(floor_with_two_slots), 2)
+}
+
+pub fn floor_rejects_duplicate_slot_id_test() {
+  let new_floor = make_floor()
+  let first_slot = make_slot("SLOT-01")
+  let duplicate_slot = make_slot("SLOT-01")
+
+  let assert Ok(floor_with_slot) = floor.add_parking_slot(new_floor, first_slot)
+
+  should.equal(
+    floor.add_parking_slot(floor_with_slot, duplicate_slot),
+    Error(floor.ParkingSlotAlreadyOnFloor),
+  )
+}
+
+// MARK: Immutability
+
+pub fn failed_add_does_not_change_original_floor_test() {
+  let new_floor = make_floor()
+  let slot = make_slot("SLOT-01")
+
+  let assert Ok(updated_floor) = floor.add_parking_slot(new_floor, slot)
+
+  should.equal(floor.get_parking_floor_slot_count(new_floor), 0)
+  should.equal(floor.get_parking_floor_slot_count(updated_floor), 1)
+}
+
+pub fn successful_add_does_not_change_original_floor_test() {
+  let original_floor = make_floor()
+  let slot = make_slot("SLOT-01")
+
+  let assert Ok(updated_floor) = floor.add_parking_slot(original_floor, slot)
+
+  should.equal(floor.get_parking_floor_slot_count(original_floor), 0)
+  should.equal(floor.get_parking_floor_slot_count(updated_floor), 1)
+}
+
+
+============================================================
+FILE: test/domain/parking_allocation_test.gleam
+============================================================
+import domain/parking_allocation
+import domain/parking_session
+import domain/parking_slot
+import domain/vehicle
+import gleeunit/should
+
+// MARK: Test Helpers
+
+fn make_vehicle(
+  id: String,
+  vehicle_type: vehicle.VehicleType,
+) -> vehicle.Vehicle {
+  let assert Ok(vehicle_id) = vehicle.new_vehicle_id(id)
+  let assert Ok(plate_number) = vehicle.new_plate_number("B 1234 ABC")
+
+  vehicle.new_vehicle(vehicle_id, plate_number, vehicle_type)
+}
+
+fn make_slot(
+  id: String,
+  supported_type: vehicle.VehicleType,
+) -> parking_slot.ParkingSlot {
+  let assert Ok(slot_id) = parking_slot.new_parking_slot_id(id)
+
+  parking_slot.new_parking_slot(slot_id, supported_type)
+}
+
+fn make_session_id(id: String) -> parking_session.ParkingSessionId {
+  let assert Ok(session_id) = parking_session.new_parking_session_id(id)
+
+  session_id
+}
+
+fn make_existing_session(
+  session_id: String,
+  parked_vehicle: vehicle.Vehicle,
+  slot: parking_slot.ParkingSlot,
+  entry_time: Int,
+) -> parking_session.ParkingSession {
+  let assert Ok(session) =
+    parking_session.new_parking_session(
+      make_session_id(session_id),
+      vehicle.get_vehicle_id(parked_vehicle),
+      parking_slot.get_parking_slot_id(slot),
+      entry_time,
+    )
+
+  session
+}
+
+fn make_allocation_request(
+  session_id: String,
+  candidate_vehicle: vehicle.Vehicle,
+  slot: parking_slot.ParkingSlot,
+  entry_time: Int,
+) -> parking_allocation.ParkingAllocationRequest {
+  parking_allocation.ParkingAllocationRequest(
+    session_id: make_session_id(session_id),
+    vehicle: candidate_vehicle,
+    slot: slot,
+    entry_time: entry_time,
+  )
+}
+
+// MARK: Successful Allocation
+
+pub fn allocation_succeeds_when_vehicle_and_slot_are_available_test() {
+  let car = make_vehicle("VEHICLE-001", vehicle.Car)
+  let slot = make_slot("SLOT-001", vehicle.Car)
+
+  let request = make_allocation_request("SESSION-001", car, slot, 1000)
+
+  let result = parking_allocation.allocate_parking_session([], request)
+
+  case result {
+    Ok(session) -> {
+      parking_session.get_parking_session_state(session)
+      |> should.equal(parking_session.Active)
+
+      parking_session.get_parking_session_vehicle_id(session)
+      |> should.equal(vehicle.get_vehicle_id(car))
+
+      parking_session.get_parking_session_slot_id(session)
+      |> should.equal(parking_slot.get_parking_slot_id(slot))
+
+      parking_session.get_parking_session_entry_time(session)
+      |> should.equal(1000)
+    }
+
+    Error(_) -> should.fail()
+  }
+}
+
+// MARK: Vehicle Already Parked
+
+pub fn allocation_fails_when_vehicle_already_has_active_session_test() {
+  let car = make_vehicle("VEHICLE-001", vehicle.Car)
+  let existing_slot = make_slot("SLOT-001", vehicle.Car)
+  let target_slot = make_slot("SLOT-002", vehicle.Car)
+
+  let existing_session =
+    make_existing_session("SESSION-001", car, existing_slot, 1000)
+
+  let request = make_allocation_request("SESSION-002", car, target_slot, 2000)
+
+  parking_allocation.allocate_parking_session([existing_session], request)
+  |> should.equal(Error(parking_allocation.VehicleAlreadyParked))
+}
+
+// MARK: Slot Already Occupied
+
+pub fn allocation_fails_when_slot_is_occupied_test() {
+  let existing_car = make_vehicle("VEHICLE-001", vehicle.Car)
+  let new_car = make_vehicle("VEHICLE-002", vehicle.Car)
+  let slot = make_slot("SLOT-001", vehicle.Car)
+
+  let existing_session =
+    make_existing_session("SESSION-001", existing_car, slot, 1000)
+
+  let request = make_allocation_request("SESSION-002", new_car, slot, 2000)
+
+  parking_allocation.allocate_parking_session([existing_session], request)
+  |> should.equal(Error(parking_allocation.ParkingSlotOccupied))
+}
+
+// MARK: Vehicle Type Compatibility
+
+pub fn allocation_fails_when_vehicle_type_is_not_supported_test() {
+  let motorcycle = make_vehicle("VEHICLE-001", vehicle.Motorcycle)
+  let car_slot = make_slot("SLOT-001", vehicle.Car)
+
+  let request =
+    make_allocation_request("SESSION-001", motorcycle, car_slot, 1000)
+
+  parking_allocation.allocate_parking_session([], request)
+  |> should.equal(Error(parking_allocation.VehicleTypeNotSupported))
+}
+
+// MARK: Invalid Entry Time
+
+pub fn allocation_fails_when_entry_time_is_negative_test() {
+  let car = make_vehicle("VEHICLE-001", vehicle.Car)
+  let slot = make_slot("SLOT-001", vehicle.Car)
+
+  let request = make_allocation_request("SESSION-001", car, slot, -1)
+
+  parking_allocation.allocate_parking_session([], request)
+  |> should.equal(Error(parking_allocation.InvalidEntryTime))
+}
+
+// MARK: Validation Priority
+
+pub fn vehicle_type_error_takes_priority_over_availability_errors_test() {
+  let car = make_vehicle("VEHICLE-001", vehicle.Car)
+  let motorcycle = make_vehicle("VEHICLE-002", vehicle.Motorcycle)
+  let occupied_slot = make_slot("SLOT-001", vehicle.Car)
+
+  let existing_session =
+    make_existing_session("SESSION-001", car, occupied_slot, 1000)
+
+  let request =
+    make_allocation_request("SESSION-002", motorcycle, occupied_slot, 2000)
+
+  parking_allocation.allocate_parking_session([existing_session], request)
+  |> should.equal(Error(parking_allocation.VehicleTypeNotSupported))
+}
+
+// MARK: Reuse After Session Closure
+
+pub fn vehicle_can_park_again_after_previous_session_is_closed_test() {
+  let car = make_vehicle("VEHICLE-001", vehicle.Car)
+  let slot = make_slot("SLOT-001", vehicle.Car)
+
+  let existing_session = make_existing_session("SESSION-001", car, slot, 1000)
+
+  let assert Ok(closed_session) =
+    parking_session.close_parking_session(existing_session, 1500)
+
+  let request = make_allocation_request("SESSION-002", car, slot, 2000)
+
+  let result =
+    parking_allocation.allocate_parking_session([closed_session], request)
+
+  case result {
+    Ok(session) ->
+      parking_session.get_parking_session_state(session)
+      |> should.equal(parking_session.Active)
+
+    Error(_) -> should.fail()
+  }
+}
+
+pub fn slot_can_be_reused_after_previous_session_is_closed_test() {
+  let first_car = make_vehicle("VEHICLE-001", vehicle.Car)
+  let second_car = make_vehicle("VEHICLE-002", vehicle.Car)
+  let slot = make_slot("SLOT-001", vehicle.Car)
+
+  let existing_session =
+    make_existing_session("SESSION-001", first_car, slot, 1000)
+
+  let assert Ok(closed_session) =
+    parking_session.close_parking_session(existing_session, 1500)
+
+  let request = make_allocation_request("SESSION-002", second_car, slot, 2000)
+
+  let result =
+    parking_allocation.allocate_parking_session([closed_session], request)
+
+  case result {
+    Ok(session) -> {
+      parking_session.get_parking_session_vehicle_id(session)
+      |> should.equal(vehicle.get_vehicle_id(second_car))
+
+      parking_session.get_parking_session_slot_id(session)
+      |> should.equal(parking_slot.get_parking_slot_id(slot))
+    }
+
+    Error(_) -> should.fail()
+  }
+}
+
+
+============================================================
+FILE: test/domain/parking_fee_test.gleam
+============================================================
+import domain/parking_fee
+import gleeunit/should
+
+// MARK: Validation
+
+pub fn parking_fee_rejects_negative_duration_test() {
+  should.equal(
+    parking_fee.calculate_parking_fee(-1, 5000),
+    Error(parking_fee.InvalidDuration),
+  )
+}
+
+pub fn parking_fee_rejects_zero_hourly_rate_test() {
+  should.equal(
+    parking_fee.calculate_parking_fee(3600, 0),
+    Error(parking_fee.InvalidHourlyRate),
+  )
+}
+
+pub fn parking_fee_rejects_negative_hourly_rate_test() {
+  should.equal(
+    parking_fee.calculate_parking_fee(3600, -5000),
+    Error(parking_fee.InvalidHourlyRate),
+  )
+}
+
+// MARK: Proportional Calculation
+
+pub fn parking_fee_for_zero_duration_is_zero_test() {
+  should.equal(parking_fee.calculate_parking_fee(0, 5000), Ok(0))
+}
+
+pub fn parking_fee_for_ten_minutes_is_proportional_test() {
+  should.equal(parking_fee.calculate_parking_fee(600, 5000), Ok(833))
+}
+
+pub fn parking_fee_for_fifteen_minutes_is_proportional_test() {
+  should.equal(parking_fee.calculate_parking_fee(900, 5000), Ok(1250))
+}
+
+pub fn parking_fee_for_thirty_minutes_is_proportional_test() {
+  should.equal(parking_fee.calculate_parking_fee(1800, 5000), Ok(2500))
+}
+
+pub fn parking_fee_for_one_hour_test() {
+  should.equal(parking_fee.calculate_parking_fee(3600, 5000), Ok(5000))
+}
+
+pub fn parking_fee_for_seventy_minutes_is_proportional_test() {
+  should.equal(parking_fee.calculate_parking_fee(4200, 5000), Ok(5833))
+}
+
+// MARK: Rounding
+
+pub fn parking_fee_rounds_fraction_below_half_down_test() {
+  // 1 second at Rp1,000/hour = Rp0.277...
+  should.equal(parking_fee.calculate_parking_fee(1, 1000), Ok(0))
+}
+
+pub fn parking_fee_rounds_half_rupiah_up_test() {
+  // 18 seconds at Rp100/hour = exactly Rp0.5.
+  should.equal(parking_fee.calculate_parking_fee(18, 100), Ok(1))
+}
+
+pub fn parking_fee_rounds_fraction_above_half_up_test() {
+  // 19 seconds at Rp100/hour = Rp0.527...
+  should.equal(parking_fee.calculate_parking_fee(19, 100), Ok(1))
+}
+
+// MARK: Different Hourly Rates
+
+pub fn parking_fee_uses_the_supplied_hourly_rate_test() {
+  should.equal(parking_fee.calculate_parking_fee(1800, 10_000), Ok(5000))
+}
+
+pub fn parking_fee_calculates_large_duration_test() {
+  // 24 hours at Rp5,000/hour.
+  should.equal(parking_fee.calculate_parking_fee(86_400, 5000), Ok(120_000))
+}
+
+
+============================================================
+FILE: test/domain/parking_pricing_policy_test.gleam
+============================================================
+import domain/parking_pricing_policy
+import domain/vehicle
+import gleeunit/should
+
+// MARK: Test Helpers
+
+fn create_pricing_policy() -> parking_pricing_policy.ParkingPricingPolicy {
+  let assert Ok(policy) =
+    parking_pricing_policy.new_parking_pricing_policy(2000, 5000, 10_000)
+
+  policy
+}
+
+// MARK: Construction
+
+pub fn pricing_policy_accepts_valid_rates_test() {
+  let result =
+    parking_pricing_policy.new_parking_pricing_policy(2000, 5000, 10_000)
+
+  should.be_ok(result)
+}
+
+pub fn pricing_policy_rejects_zero_motorcycle_rate_test() {
+  should.equal(
+    parking_pricing_policy.new_parking_pricing_policy(0, 5000, 10_000),
+    Error(parking_pricing_policy.InvalidMotorcycleHourlyRate),
+  )
+}
+
+pub fn pricing_policy_rejects_negative_motorcycle_rate_test() {
+  should.equal(
+    parking_pricing_policy.new_parking_pricing_policy(-2000, 5000, 10_000),
+    Error(parking_pricing_policy.InvalidMotorcycleHourlyRate),
+  )
+}
+
+pub fn pricing_policy_rejects_zero_car_rate_test() {
+  should.equal(
+    parking_pricing_policy.new_parking_pricing_policy(2000, 0, 10_000),
+    Error(parking_pricing_policy.InvalidCarHourlyRate),
+  )
+}
+
+pub fn pricing_policy_rejects_negative_car_rate_test() {
+  should.equal(
+    parking_pricing_policy.new_parking_pricing_policy(2000, -5000, 10_000),
+    Error(parking_pricing_policy.InvalidCarHourlyRate),
+  )
+}
+
+pub fn pricing_policy_rejects_zero_truck_rate_test() {
+  should.equal(
+    parking_pricing_policy.new_parking_pricing_policy(2000, 5000, 0),
+    Error(parking_pricing_policy.InvalidTruckHourlyRate),
+  )
+}
+
+pub fn pricing_policy_rejects_negative_truck_rate_test() {
+  should.equal(
+    parking_pricing_policy.new_parking_pricing_policy(2000, 5000, -10_000),
+    Error(parking_pricing_policy.InvalidTruckHourlyRate),
+  )
+}
+
+// MARK: Accessors
+
+pub fn motorcycle_hourly_rate_accessor_test() {
+  let policy = create_pricing_policy()
+
+  should.equal(parking_pricing_policy.get_motorcycle_hourly_rate(policy), 2000)
+}
+
+pub fn car_hourly_rate_accessor_test() {
+  let policy = create_pricing_policy()
+
+  should.equal(parking_pricing_policy.get_car_hourly_rate(policy), 5000)
+}
+
+pub fn truck_hourly_rate_accessor_test() {
+  let policy = create_pricing_policy()
+
+  should.equal(parking_pricing_policy.get_truck_hourly_rate(policy), 10_000)
+}
+
+// MARK: Vehicle Rate Lookup
+
+pub fn get_hourly_rate_returns_motorcycle_rate_test() {
+  let policy = create_pricing_policy()
+
+  should.equal(
+    parking_pricing_policy.get_hourly_rate(policy, vehicle.Motorcycle),
+    2000,
+  )
+}
+
+pub fn get_hourly_rate_returns_car_rate_test() {
+  let policy = create_pricing_policy()
+
+  should.equal(
+    parking_pricing_policy.get_hourly_rate(policy, vehicle.Car),
+    5000,
+  )
+}
+
+pub fn get_hourly_rate_returns_truck_rate_test() {
+  let policy = create_pricing_policy()
+
+  should.equal(
+    parking_pricing_policy.get_hourly_rate(policy, vehicle.Truck),
+    10_000,
+  )
+}
+
+
+============================================================
+FILE: test/domain/parking_session_test.gleam
+============================================================
+import domain/parking_session
+import domain/parking_slot
+import domain/vehicle
+import gleam/option.{None, Some}
+import gleeunit/should
+
+// MARK: Test Helpers
+
+fn make_parking_session() -> parking_session.ParkingSession {
+  let assert Ok(session_id) =
+    parking_session.new_parking_session_id("SESSION-001")
+
+  let assert Ok(vehicle_id) = vehicle.new_vehicle_id("VEHICLE-001")
+
+  let assert Ok(slot_id) = parking_slot.new_parking_slot_id("SLOT-001")
+
+  let assert Ok(session) =
+    parking_session.new_parking_session(session_id, vehicle_id, slot_id, 1000)
+
+  session
+}
+
+// MARK: Parking Session ID
+
+pub fn session_id_rejects_empty_value_test() {
+  should.equal(
+    parking_session.new_parking_session_id(""),
+    Error(parking_session.EmptyParkingSessionId),
+  )
+}
+
+pub fn session_id_rejects_whitespace_test() {
+  should.equal(
+    parking_session.new_parking_session_id("   "),
+    Error(parking_session.EmptyParkingSessionId),
+  )
+}
+
+pub fn session_id_trims_whitespace_test() {
+  let assert Ok(id) = parking_session.new_parking_session_id("  SESSION-001  ")
+
+  should.equal(parking_session.get_parking_session_id_value(id), "SESSION-001")
+}
+
+// MARK: Initial State
+
+pub fn new_session_starts_active_test() {
+  let session = make_parking_session()
+
+  should.equal(
+    parking_session.get_parking_session_state(session),
+    parking_session.Active,
+  )
+}
+
+pub fn new_session_has_no_exit_time_test() {
+  let session = make_parking_session()
+
+  should.equal(parking_session.get_parking_session_exit_time(session), None)
+}
+
+pub fn new_session_preserves_entry_time_test() {
+  let session = make_parking_session()
+
+  should.equal(parking_session.get_parking_session_entry_time(session), 1000)
+}
+
+// MARK: Close Parking Session
+
+pub fn active_session_can_be_closed_test() {
+  let session = make_parking_session()
+
+  let assert Ok(closed_session) =
+    parking_session.close_parking_session(session, 2000)
+
+  should.equal(
+    parking_session.get_parking_session_state(closed_session),
+    parking_session.Closed(2000),
+  )
+
+  should.equal(
+    parking_session.get_parking_session_exit_time(closed_session),
+    Some(2000),
+  )
+}
+
+pub fn session_rejects_exit_before_entry_test() {
+  let session = make_parking_session()
+
+  should.equal(
+    parking_session.close_parking_session(session, 999),
+    Error(parking_session.InvalidExitTime),
+  )
+}
+
+pub fn closed_session_cannot_be_closed_again_test() {
+  let session = make_parking_session()
+
+  let assert Ok(closed_session) =
+    parking_session.close_parking_session(session, 2000)
+
+  should.equal(
+    parking_session.close_parking_session(closed_session, 3000),
+    Error(parking_session.ParkingSessionAlreadyClosed),
+  )
+}
+
+// MARK: Identity and Immutability
+
+pub fn closing_session_preserves_identity_and_entry_time_test() {
+  let session = make_parking_session()
+
+  let assert Ok(closed_session) =
+    parking_session.close_parking_session(session, 2000)
+
+  should.equal(
+    parking_session.get_parking_session_id_value(
+      parking_session.get_parking_session_id(closed_session),
+    ),
+    "SESSION-001",
+  )
+
+  should.equal(
+    parking_session.get_parking_session_entry_time(closed_session),
+    1000,
+  )
+}
+
+pub fn closing_session_does_not_mutate_original_test() {
+  let session = make_parking_session()
+
+  let assert Ok(closed_session) =
+    parking_session.close_parking_session(session, 2000)
+
+  should.equal(
+    parking_session.get_parking_session_state(session),
+    parking_session.Active,
+  )
+
+  should.equal(
+    parking_session.get_parking_session_state(closed_session),
+    parking_session.Closed(2000),
+  )
+}
+
+// MARK: Entry and Exit Time Boundaries
+
+pub fn negative_entry_time_is_rejected_test() {
+  let assert Ok(session_id) =
+    parking_session.new_parking_session_id("SESSION-001")
+
+  let assert Ok(vehicle_id) = vehicle.new_vehicle_id("VEHICLE-001")
+
+  let assert Ok(slot_id) = parking_slot.new_parking_slot_id("SLOT-001")
+
+  should.equal(
+    parking_session.new_parking_session(session_id, vehicle_id, slot_id, -1),
+    Error(parking_session.InvalidEntryTime),
+  )
+}
+
+pub fn zero_entry_time_is_accepted_test() {
+  let assert Ok(session_id) =
+    parking_session.new_parking_session_id("SESSION-001")
+
+  let assert Ok(vehicle_id) = vehicle.new_vehicle_id("VEHICLE-001")
+
+  let assert Ok(slot_id) = parking_slot.new_parking_slot_id("SLOT-001")
+
+  let assert Ok(session) =
+    parking_session.new_parking_session(session_id, vehicle_id, slot_id, 0)
+
+  should.equal(
+    parking_session.get_parking_session_state(session),
+    parking_session.Active,
+  )
+
+  should.equal(parking_session.get_parking_session_entry_time(session), 0)
+}
+
+pub fn exit_time_equal_to_entry_time_is_accepted_test() {
+  let assert Ok(session_id) =
+    parking_session.new_parking_session_id("SESSION-001")
+
+  let assert Ok(vehicle_id) = vehicle.new_vehicle_id("VEHICLE-001")
+
+  let assert Ok(slot_id) = parking_slot.new_parking_slot_id("SLOT-001")
+
+  let assert Ok(session) =
+    parking_session.new_parking_session(session_id, vehicle_id, slot_id, 1000)
+
+  let assert Ok(closed_session) =
+    parking_session.close_parking_session(session, 1000)
+
+  should.equal(
+    parking_session.get_parking_session_state(closed_session),
+    parking_session.Closed(1000),
+  )
+}
+
+
+============================================================
+FILE: test/domain/parking_slot_test.gleam
+============================================================
+import domain/parking_slot
+import domain/vehicle
+import gleeunit/should
+
+// MARK: Parking Slot ID
+
+pub fn parking_slot_id_rejects_empty_string_test() {
+  parking_slot.new_parking_slot_id("")
+  |> should.equal(Error(parking_slot.EmptyParkingSlotId))
+}
+
+pub fn parking_slot_id_rejects_whitespace_only_test() {
+  parking_slot.new_parking_slot_id("   ")
+  |> should.equal(Error(parking_slot.EmptyParkingSlotId))
+}
+
+pub fn parking_slot_id_trims_whitespace_test() {
+  let result = parking_slot.new_parking_slot_id(" A-01 ")
+
+  case result {
+    Ok(id) ->
+      parking_slot.get_parking_slot_id_value(id)
+      |> should.equal("A-01")
+
+    Error(_) -> should.fail()
+  }
+}
+
+// MARK: Parking Slot
+
+pub fn parking_slot_stores_its_attributes_test() {
+  let assert Ok(id) = parking_slot.new_parking_slot_id("A-01")
+
+  let slot = parking_slot.new_parking_slot(id, vehicle.Car)
+
+  parking_slot.get_parking_slot_id(slot)
+  |> parking_slot.get_parking_slot_id_value
+  |> should.equal("A-01")
+
+  parking_slot.get_supported_vehicle_type(slot)
+  |> should.equal(vehicle.Car)
+}
+
+// MARK: Vehicle Compatibility
+
+pub fn parking_slot_checks_vehicle_compatibility_test() {
+  let assert Ok(slot_id) = parking_slot.new_parking_slot_id("A-01")
+  let slot = parking_slot.new_parking_slot(slot_id, vehicle.Car)
+
+  let assert Ok(car_id) = vehicle.new_vehicle_id("V001")
+  let assert Ok(car_plate) = vehicle.new_plate_number("B 1234 ABC")
+  let car = vehicle.new_vehicle(car_id, car_plate, vehicle.Car)
+
+  let assert Ok(motorcycle_id) = vehicle.new_vehicle_id("V002")
+  let assert Ok(motorcycle_plate) = vehicle.new_plate_number("B 5678 XYZ")
+
+  let motorcycle =
+    vehicle.new_vehicle(motorcycle_id, motorcycle_plate, vehicle.Motorcycle)
+
+  parking_slot.supports_vehicle(slot, car)
+  |> should.equal(True)
+
+  parking_slot.supports_vehicle(slot, motorcycle)
+  |> should.equal(False)
+}
+
+
+============================================================
+FILE: test/domain/parking_ticket_test.gleam
+============================================================
+import domain/parking_session
+import domain/parking_ticket
+import gleeunit/should
+
+pub fn parking_ticket_id_rejects_empty_string_test() {
+  parking_ticket.new_parking_ticket_id("")
+  |> should.equal(Error(parking_ticket.EmptyParkingTicketId))
+}
+
+pub fn parking_ticket_id_rejects_whitespace_test() {
+  parking_ticket.new_parking_ticket_id("   ")
+  |> should.equal(Error(parking_ticket.EmptyParkingTicketId))
+}
+
+pub fn parking_ticket_id_trims_whitespace_test() {
+  let result = parking_ticket.new_parking_ticket_id(" PT001 ")
+
+  case result {
+    Ok(id) ->
+      parking_ticket.get_parking_ticket_id_value(id)
+      |> should.equal("PT001")
+
+    Error(_) -> should.fail()
+  }
+}
+
+pub fn new_parking_ticket_stores_ticket_id_test() {
+  let assert Ok(ticket_id) = parking_ticket.new_parking_ticket_id("PT001")
+
+  let assert Ok(session_id) = parking_session.new_parking_session_id("PS001")
+
+  let ticket =
+    parking_ticket.new_parking_ticket(ticket_id, session_id, 1_798_000_000)
+
+  parking_ticket.get_parking_ticket_id(ticket)
+  |> parking_ticket.get_parking_ticket_id_value
+  |> should.equal("PT001")
+}
+
+pub fn new_parking_ticket_stores_session_id_test() {
+  let assert Ok(ticket_id) = parking_ticket.new_parking_ticket_id("PT001")
+
+  let assert Ok(session_id) = parking_session.new_parking_session_id("PS001")
+
+  let ticket =
+    parking_ticket.new_parking_ticket(ticket_id, session_id, 1_798_000_000)
+
+  parking_ticket.get_parking_ticket_session_id(ticket)
+  |> parking_session.get_parking_session_id_value
+  |> should.equal("PS001")
+}
+
+pub fn new_parking_ticket_stores_issued_at_test() {
+  let assert Ok(ticket_id) = parking_ticket.new_parking_ticket_id("PT001")
+
+  let assert Ok(session_id) = parking_session.new_parking_session_id("PS001")
+
+  let ticket =
+    parking_ticket.new_parking_ticket(ticket_id, session_id, 1_798_000_000)
+
+  parking_ticket.get_parking_ticket_issued_at(ticket)
+  |> should.equal(1_798_000_000)
+}
+
+
+============================================================
+FILE: test/domain/payment_test.gleam
+============================================================
+import domain/parking_session
+import domain/payment
+import gleeunit/should
+
+// MARK: Test Helpers
+
+fn create_payment() -> payment.Payment {
+  let assert Ok(payment_id) = payment.new_payment_id("PAY-001")
+
+  let assert Ok(session_id) =
+    parking_session.new_parking_session_id("SESSION-001")
+
+  let assert Ok(new_payment) =
+    payment.new_payment(payment_id, session_id, 15_000, payment.Cash, 1000)
+
+  new_payment
+}
+
+// MARK: Payment ID
+
+pub fn payment_id_rejects_empty_value_test() {
+  should.equal(payment.new_payment_id(""), Error(payment.EmptyPaymentId))
+}
+
+pub fn payment_id_rejects_whitespace_test() {
+  should.equal(payment.new_payment_id("   "), Error(payment.EmptyPaymentId))
+}
+
+pub fn payment_id_trims_whitespace_test() {
+  let assert Ok(id) = payment.new_payment_id("  PAY-001  ")
+
+  should.equal(payment.get_payment_id_value(id), "PAY-001")
+}
+
+pub fn payment_id_accessor_returns_payment_id_test() {
+  let new_payment = create_payment()
+
+  payment.get_payment_id(new_payment)
+  |> payment.get_payment_id_value
+  |> should.equal("PAY-001")
+}
+
+// MARK: Payment Construction
+
+pub fn payment_rejects_zero_amount_test() {
+  let assert Ok(id) = payment.new_payment_id("PAY-001")
+
+  let assert Ok(session_id) =
+    parking_session.new_parking_session_id("SESSION-001")
+
+  should.equal(
+    payment.new_payment(id, session_id, 0, payment.Cash, 1000),
+    Error(payment.InvalidPaymentAmount),
+  )
+}
+
+pub fn payment_rejects_negative_amount_test() {
+  let assert Ok(id) = payment.new_payment_id("PAY-001")
+
+  let assert Ok(session_id) =
+    parking_session.new_parking_session_id("SESSION-001")
+
+  should.equal(
+    payment.new_payment(id, session_id, -1000, payment.Cash, 1000),
+    Error(payment.InvalidPaymentAmount),
+  )
+}
+
+pub fn new_payment_starts_pending_test() {
+  let new_payment = create_payment()
+
+  should.equal(payment.get_payment_status(new_payment), payment.Pending)
+}
+
+// MARK: Payment Accessors
+
+pub fn payment_session_id_accessor_returns_session_id_test() {
+  let new_payment = create_payment()
+
+  let assert Ok(expected_session_id) =
+    parking_session.new_parking_session_id("SESSION-001")
+
+  should.equal(payment.get_payment_session_id(new_payment), expected_session_id)
+}
+
+pub fn payment_amount_accessor_returns_amount_test() {
+  let new_payment = create_payment()
+
+  should.equal(payment.get_payment_amount(new_payment), 15_000)
+}
+
+pub fn payment_method_accessor_returns_method_test() {
+  let new_payment = create_payment()
+
+  should.equal(payment.get_payment_method(new_payment), payment.Cash)
+}
+
+pub fn payment_created_at_accessor_returns_timestamp_test() {
+  let new_payment = create_payment()
+
+  should.equal(payment.get_payment_created_at(new_payment), 1000)
+}
+
+// MARK: Payment Methods
+
+pub fn payment_supports_qris_method_test() {
+  let assert Ok(id) = payment.new_payment_id("PAY-QRIS")
+
+  let assert Ok(session_id) =
+    parking_session.new_parking_session_id("SESSION-001")
+
+  let assert Ok(new_payment) =
+    payment.new_payment(id, session_id, 15_000, payment.Qris, 1000)
+
+  should.equal(payment.get_payment_method(new_payment), payment.Qris)
+}
+
+pub fn payment_supports_debit_card_method_test() {
+  let assert Ok(id) = payment.new_payment_id("PAY-DEBIT")
+
+  let assert Ok(session_id) =
+    parking_session.new_parking_session_id("SESSION-001")
+
+  let assert Ok(new_payment) =
+    payment.new_payment(id, session_id, 15_000, payment.DebitCard, 1000)
+
+  should.equal(payment.get_payment_method(new_payment), payment.DebitCard)
+}
+
+pub fn payment_supports_ewallet_method_test() {
+  let assert Ok(id) = payment.new_payment_id("PAY-EWALLET")
+
+  let assert Ok(session_id) =
+    parking_session.new_parking_session_id("SESSION-001")
+
+  let assert Ok(new_payment) =
+    payment.new_payment(id, session_id, 15_000, payment.EWallet, 1000)
+
+  should.equal(payment.get_payment_method(new_payment), payment.EWallet)
+}
+
+// MARK: Successful Transition
+
+pub fn pending_payment_can_succeed_test() {
+  let new_payment = create_payment()
+
+  let assert Ok(succeeded_payment) = payment.succeed_payment(new_payment)
+
+  should.equal(payment.get_payment_status(succeeded_payment), payment.Succeeded)
+}
+
+pub fn pending_payment_can_fail_test() {
+  let new_payment = create_payment()
+
+  let assert Ok(failed_payment) = payment.fail_payment(new_payment)
+
+  should.equal(payment.get_payment_status(failed_payment), payment.Failed)
+}
+
+pub fn pending_payment_can_be_cancelled_test() {
+  let new_payment = create_payment()
+
+  let assert Ok(cancelled_payment) = payment.cancel_payment(new_payment)
+
+  should.equal(payment.get_payment_status(cancelled_payment), payment.Cancelled)
+}
+
+// MARK: Finalized Payment
+
+pub fn succeeded_payment_cannot_be_finalized_again_test() {
+  let new_payment = create_payment()
+
+  let assert Ok(succeeded_payment) = payment.succeed_payment(new_payment)
+
+  should.equal(
+    payment.fail_payment(succeeded_payment),
+    Error(payment.PaymentAlreadyFinalized),
+  )
+}
+
+pub fn failed_payment_cannot_be_finalized_again_test() {
+  let new_payment = create_payment()
+
+  let assert Ok(failed_payment) = payment.fail_payment(new_payment)
+
+  should.equal(
+    payment.succeed_payment(failed_payment),
+    Error(payment.PaymentAlreadyFinalized),
+  )
+}
+
+pub fn cancelled_payment_cannot_be_finalized_again_test() {
+  let new_payment = create_payment()
+
+  let assert Ok(cancelled_payment) = payment.cancel_payment(new_payment)
+
+  should.equal(
+    payment.succeed_payment(cancelled_payment),
+    Error(payment.PaymentAlreadyFinalized),
+  )
+}
+
+// MARK: Payment Immutability
+
+pub fn payment_preserves_amount_after_success_test() {
+  let new_payment = create_payment()
+
+  let assert Ok(succeeded_payment) = payment.succeed_payment(new_payment)
+
+  should.equal(payment.get_payment_amount(succeeded_payment), 15_000)
+}
+
+pub fn original_payment_remains_pending_after_success_test() {
+  let original_payment = create_payment()
+
+  let assert Ok(_succeeded_payment) = payment.succeed_payment(original_payment)
+
+  should.equal(payment.get_payment_status(original_payment), payment.Pending)
+}
+
+
+============================================================
+FILE: test/domain/vehicle_test.gleam
+============================================================
+import domain/vehicle
+import gleeunit/should
+
+// MARK: Vehicle ID
+
+pub fn vehicle_id_rejects_empty_string_test() {
+  vehicle.new_vehicle_id("")
+  |> should.equal(Error(vehicle.EmptyVehicleId))
+}
+
+pub fn vehicle_id_rejects_whitespace_only_test() {
+  vehicle.new_vehicle_id("   ")
+  |> should.equal(Error(vehicle.EmptyVehicleId))
+}
+
+pub fn vehicle_id_trims_whitespace_test() {
+  let result = vehicle.new_vehicle_id(" V001 ")
+
+  case result {
+    Ok(id) ->
+      vehicle.get_vehicle_id_value(id)
+      |> should.equal("V001")
+
+    Error(_) -> should.fail()
+  }
+}
+
+// MARK: Plate Number
+
+pub fn plate_number_rejects_empty_string_test() {
+  vehicle.new_plate_number("")
+  |> should.equal(Error(vehicle.EmptyPlateNumber))
+}
+
+pub fn plate_number_rejects_whitespace_only_test() {
+  vehicle.new_plate_number("   ")
+  |> should.equal(Error(vehicle.EmptyPlateNumber))
+}
+
+pub fn plate_number_trims_whitespace_test() {
+  let result = vehicle.new_plate_number(" B 1234 ABC ")
+
+  case result {
+    Ok(plate) ->
+      vehicle.get_plate_number_value(plate)
+      |> should.equal("B 1234 ABC")
+
+    Error(_) -> should.fail()
+  }
+}
+
+// MARK: Vehicle
+
+pub fn vehicle_stores_its_attributes_test() {
+  let assert Ok(id) = vehicle.new_vehicle_id("V001")
+  let assert Ok(plate) = vehicle.new_plate_number("B 1234 ABC")
+
+  let registered_vehicle = vehicle.new_vehicle(id, plate, vehicle.Car)
+
+  vehicle.get_vehicle_id(registered_vehicle)
+  |> vehicle.get_vehicle_id_value
+  |> should.equal("V001")
+
+  vehicle.get_vehicle_plate_number(registered_vehicle)
+  |> vehicle.get_plate_number_value
+  |> should.equal("B 1234 ABC")
+
+  vehicle.get_vehicle_type(registered_vehicle)
+  |> should.equal(vehicle.Car)
+}
+
+
+============================================================
+FILE: test/infrastructure/entry_parking_test.gleam
+============================================================
+import application/entry_parking
+import domain/floor
+import domain/parking_allocation
+import domain/parking_session
+import domain/parking_slot
+import domain/parking_ticket
+import domain/vehicle
+import gleeunit/should
+
+// MARK: Test Helpers
+
+fn make_vehicle(
+  id: String,
+  vehicle_type: vehicle.VehicleType,
+) -> vehicle.Vehicle {
+  let assert Ok(vehicle_id) = vehicle.new_vehicle_id(id)
+  let assert Ok(plate_number) = vehicle.new_plate_number("B 1234 ABC")
+
+  vehicle.new_vehicle(vehicle_id, plate_number, vehicle_type)
+}
+
+fn make_slot(
+  id: String,
+  supported_type: vehicle.VehicleType,
+) -> parking_slot.ParkingSlot {
+  let assert Ok(slot_id) = parking_slot.new_parking_slot_id(id)
+
+  parking_slot.new_parking_slot(slot_id, supported_type)
+}
+
+fn make_floor(
+  id: String,
+  slots: List(parking_slot.ParkingSlot),
+) -> floor.ParkingFloor {
+  let assert Ok(floor_id) = floor.new_parking_floor_id(id)
+  let parking_floor = floor.new_parking_floor(floor_id)
+
+  add_slots(parking_floor, slots)
+}
+
+fn add_slots(
+  parking_floor: floor.ParkingFloor,
+  slots: List(parking_slot.ParkingSlot),
+) -> floor.ParkingFloor {
+  case slots {
+    [] -> parking_floor
+
+    [slot, ..remaining_slots] -> {
+      let assert Ok(updated_floor) = floor.add_parking_slot(parking_floor, slot)
+
+      add_slots(updated_floor, remaining_slots)
+    }
+  }
+}
+
+fn make_session_id(id: String) -> parking_session.ParkingSessionId {
+  let assert Ok(session_id) = parking_session.new_parking_session_id(id)
+
+  session_id
+}
+
+fn make_ticket_id(id: String) -> parking_ticket.ParkingTicketId {
+  let assert Ok(ticket_id) = parking_ticket.new_parking_ticket_id(id)
+
+  ticket_id
+}
+
+fn make_request(
+  session_id: String,
+  ticket_id: String,
+  candidate_vehicle: vehicle.Vehicle,
+  entry_time: Int,
+) -> entry_parking.EntryParkingRequest {
+  entry_parking.EntryParkingRequest(
+    session_id: make_session_id(session_id),
+    ticket_id: make_ticket_id(ticket_id),
+    vehicle: candidate_vehicle,
+    entry_time: entry_time,
+  )
+}
+
+fn make_existing_session(
+  session_id: String,
+  parked_vehicle: vehicle.Vehicle,
+  slot: parking_slot.ParkingSlot,
+  entry_time: Int,
+) -> parking_session.ParkingSession {
+  let assert Ok(session) =
+    parking_session.new_parking_session(
+      make_session_id(session_id),
+      vehicle.get_vehicle_id(parked_vehicle),
+      parking_slot.get_parking_slot_id(slot),
+      entry_time,
+    )
+
+  session
+}
+
+// MARK: Successful Entry
+
+pub fn entry_succeeds_when_compatible_slot_is_available_test() {
+  let car = make_vehicle("VEHICLE-001", vehicle.Car)
+  let slot = make_slot("SLOT-001", vehicle.Car)
+  let parking_floor = make_floor("FLOOR-001", [slot])
+
+  let request = make_request("SESSION-001", "TICKET-001", car, 1000)
+
+  let result = entry_parking.enter_parking([parking_floor], [], request)
+
+  case result {
+    Ok(entry) -> {
+      parking_slot.get_parking_slot_id(entry.slot)
+      |> should.equal(parking_slot.get_parking_slot_id(slot))
+
+      parking_session.get_parking_session_vehicle_id(entry.session)
+      |> should.equal(vehicle.get_vehicle_id(car))
+
+      parking_session.get_parking_session_state(entry.session)
+      |> should.equal(parking_session.Active)
+
+      parking_session.get_parking_session_entry_time(entry.session)
+      |> should.equal(1000)
+
+      parking_ticket.get_parking_ticket_session_id(entry.ticket)
+      |> should.equal(make_session_id("SESSION-001"))
+
+      parking_ticket.get_parking_ticket_issued_at(entry.ticket)
+      |> should.equal(1000)
+    }
+
+    Error(_) -> should.fail()
+  }
+}
+
+// MARK: Automatic Slot Selection
+
+pub fn entry_skips_slot_with_incompatible_vehicle_type_test() {
+  let car = make_vehicle("VEHICLE-001", vehicle.Car)
+
+  let motorcycle_slot = make_slot("SLOT-001", vehicle.Motorcycle)
+  let car_slot = make_slot("SLOT-002", vehicle.Car)
+
+  let parking_floor = make_floor("FLOOR-001", [motorcycle_slot, car_slot])
+
+  let request = make_request("SESSION-001", "TICKET-001", car, 1000)
+
+  let result = entry_parking.enter_parking([parking_floor], [], request)
+
+  case result {
+    Ok(entry) ->
+      parking_slot.get_parking_slot_id(entry.slot)
+      |> should.equal(parking_slot.get_parking_slot_id(car_slot))
+
+    Error(_) -> should.fail()
+  }
+}
+
+pub fn entry_skips_occupied_slot_test() {
+  let existing_car = make_vehicle("VEHICLE-001", vehicle.Car)
+  let new_car = make_vehicle("VEHICLE-002", vehicle.Car)
+
+  let occupied_slot = make_slot("SLOT-001", vehicle.Car)
+  let available_slot = make_slot("SLOT-002", vehicle.Car)
+
+  let parking_floor = make_floor("FLOOR-001", [occupied_slot, available_slot])
+
+  let existing_session =
+    make_existing_session("SESSION-001", existing_car, occupied_slot, 1000)
+
+  let request = make_request("SESSION-002", "TICKET-002", new_car, 2000)
+
+  let result =
+    entry_parking.enter_parking([parking_floor], [existing_session], request)
+
+  case result {
+    Ok(entry) ->
+      parking_slot.get_parking_slot_id(entry.slot)
+      |> should.equal(parking_slot.get_parking_slot_id(available_slot))
+
+    Error(_) -> should.fail()
+  }
+}
+
+// MARK: Multiple Floors
+
+pub fn entry_searches_next_floor_when_first_floor_has_no_available_slot_test() {
+  let car = make_vehicle("VEHICLE-001", vehicle.Car)
+
+  let first_slot = make_slot("SLOT-001", vehicle.Car)
+  let second_slot = make_slot("SLOT-002", vehicle.Car)
+
+  let first_floor = make_floor("FLOOR-001", [first_slot])
+  let second_floor = make_floor("FLOOR-002", [second_slot])
+
+  let existing_car = make_vehicle("VEHICLE-002", vehicle.Car)
+
+  let existing_session =
+    make_existing_session("SESSION-001", existing_car, first_slot, 1000)
+
+  let request = make_request("SESSION-002", "TICKET-002", car, 2000)
+
+  let result =
+    entry_parking.enter_parking(
+      [first_floor, second_floor],
+      [existing_session],
+      request,
+    )
+
+  case result {
+    Ok(entry) -> {
+      floor.get_parking_floor_id_value(entry.floor_id)
+      |> should.equal("FLOOR-002")
+
+      parking_slot.get_parking_slot_id(entry.slot)
+      |> should.equal(parking_slot.get_parking_slot_id(second_slot))
+    }
+
+    Error(_) -> should.fail()
+  }
+}
+
+// MARK: No Available Slot
+
+pub fn entry_fails_when_no_floors_are_available_test() {
+  let car = make_vehicle("VEHICLE-001", vehicle.Car)
+
+  let request = make_request("SESSION-001", "TICKET-001", car, 1000)
+
+  entry_parking.enter_parking([], [], request)
+  |> should.equal(Error(entry_parking.NoAvailableParkingSlot))
+}
+
+pub fn entry_fails_when_all_slots_are_occupied_test() {
+  let existing_car = make_vehicle("VEHICLE-001", vehicle.Car)
+  let new_car = make_vehicle("VEHICLE-002", vehicle.Car)
+
+  let slot = make_slot("SLOT-001", vehicle.Car)
+  let parking_floor = make_floor("FLOOR-001", [slot])
+
+  let existing_session =
+    make_existing_session("SESSION-001", existing_car, slot, 1000)
+
+  let request = make_request("SESSION-002", "TICKET-002", new_car, 2000)
+
+  entry_parking.enter_parking([parking_floor], [existing_session], request)
+  |> should.equal(Error(entry_parking.NoAvailableParkingSlot))
+}
+
+// MARK: Vehicle Already Parked
+
+pub fn entry_fails_when_vehicle_already_has_active_session_test() {
+  let car = make_vehicle("VEHICLE-001", vehicle.Car)
+
+  let existing_slot = make_slot("SLOT-001", vehicle.Car)
+  let available_slot = make_slot("SLOT-002", vehicle.Car)
+
+  let parking_floor = make_floor("FLOOR-001", [available_slot])
+
+  let existing_session =
+    make_existing_session("SESSION-001", car, existing_slot, 1000)
+
+  let request = make_request("SESSION-002", "TICKET-002", car, 2000)
+
+  entry_parking.enter_parking([parking_floor], [existing_session], request)
+  |> should.equal(
+    Error(entry_parking.AllocationFailed(
+      parking_allocation.VehicleAlreadyParked,
+    )),
+  )
+}
+
+// MARK: Invalid Entry Time
+
+pub fn entry_fails_when_entry_time_is_negative_test() {
+  let car = make_vehicle("VEHICLE-001", vehicle.Car)
+  let slot = make_slot("SLOT-001", vehicle.Car)
+  let parking_floor = make_floor("FLOOR-001", [slot])
+
+  let request = make_request("SESSION-001", "TICKET-001", car, -1)
+
+  entry_parking.enter_parking([parking_floor], [], request)
+  |> should.equal(
+    Error(entry_parking.AllocationFailed(parking_allocation.InvalidEntryTime)),
+  )
+}
+
+
+============================================================
+FILE: test/infrastructure/seed_parking_layout_test.gleam
+============================================================
+import application/seed_parking_layout
+import domain/floor
+import gleam/dynamic/decode
+import gleam/list
+import gleeunit/should
+import infrastructure/sqlite_connection
+import infrastructure/sqlite_floor_repository
+import simplifile
+import sqlight
+
+fn setup_database() -> sqlight.Connection {
+  let assert Ok(db) = sqlite_connection.connect_to(":memory:")
+
+  let assert Ok(migration_sql) =
+    simplifile.read(
+      from: "priv/repo/migrations/001_create_parking_schema.up.sql",
+    )
+
+  let assert Ok(Nil) = sqlight.exec(migration_sql, on: db)
+
+  db
+}
+
+fn count_rows(db: sqlight.Connection, table: String) -> Int {
+  let assert Ok([count]) =
+    sqlight.query(
+      "SELECT COUNT(*) FROM " <> table <> ";",
+      on: db,
+      with: [],
+      expecting: decode.field(0, decode.int, fn(value) { decode.success(value) }),
+    )
+
+  count
+}
+
+fn close_database(db: sqlight.Connection) -> Nil {
+  let assert Ok(Nil) = sqlight.close(db)
+  Nil
+}
+
+// -----------------------------------------------------------------------------
+// Initial seeding
+// -----------------------------------------------------------------------------
+
+pub fn seed_parking_layout_creates_expected_layout_test() {
+  let db = setup_database()
+
+  let repository =
+    sqlite_floor_repository.new(db)
+    |> sqlite_floor_repository.to_port
+
+  seed_parking_layout.seed(repository)
+  |> should.equal(Ok(Nil))
+
+  count_rows(db, "parking_floors")
+  |> should.equal(2)
+
+  count_rows(db, "parking_slots")
+  |> should.equal(8)
+
+  close_database(db)
+}
+
+// -----------------------------------------------------------------------------
+// Idempotency
+// -----------------------------------------------------------------------------
+
+pub fn seed_parking_layout_is_idempotent_test() {
+  let db = setup_database()
+
+  let repository =
+    sqlite_floor_repository.new(db)
+    |> sqlite_floor_repository.to_port
+
+  seed_parking_layout.seed(repository)
+  |> should.equal(Ok(Nil))
+
+  seed_parking_layout.seed(repository)
+  |> should.equal(Ok(Nil))
+
+  count_rows(db, "parking_floors")
+  |> should.equal(2)
+
+  count_rows(db, "parking_slots")
+  |> should.equal(8)
+
+  close_database(db)
+}
+
+// -----------------------------------------------------------------------------
+// Domain reconstruction
+// -----------------------------------------------------------------------------
+
+pub fn seed_parking_layout_can_be_loaded_as_domain_aggregates_test() {
+  let db = setup_database()
+  let sqlite_repository = sqlite_floor_repository.new(db)
+
+  let repository =
+    sqlite_repository
+    |> sqlite_floor_repository.to_port
+
+  let assert Ok(Nil) = seed_parking_layout.seed(repository)
+
+  let assert Ok(floors) =
+    sqlite_floor_repository.get_all_floors(sqlite_repository)
+
+  list.length(floors)
+  |> should.equal(2)
+
+  let slot_counts = list.map(floors, floor.get_parking_floor_slot_count)
+
+  slot_counts
+  |> should.equal([5, 3])
+
+  close_database(db)
+}
+
+
+============================================================
+FILE: test/infrastructure/sqlite_entry_parking_transaction_test.gleam
+============================================================
+import application/entry_parking
+import application/ports/entry_parking_transaction
+import application/ports/repository_error
+import domain/parking_session
+import domain/parking_slot
+import domain/parking_ticket
+import domain/vehicle
+import gleam/dynamic/decode
+import gleeunit/should
+import infrastructure/sqlite_connection
+import infrastructure/sqlite_entry_parking_transaction
+import simplifile
+import sqlight
+
+// MARK: Test Helpers
+
+fn setup_database(with_slot: Bool) -> sqlight.Connection {
+  let assert Ok(db) = sqlite_connection.connect_to(":memory:")
+
+  let assert Ok(initial_migration) =
+    simplifile.read(
+      from: "priv/repo/migrations/001_create_parking_schema.up.sql",
+    )
+
+  let assert Ok(Nil) = sqlight.exec(initial_migration, on: db)
+
+  case with_slot {
+    True -> {
+      let assert Ok(Nil) =
+        sqlight.exec(
+          "
+          INSERT INTO parking_floors (id)
+          VALUES ('FLOOR-001');
+
+          INSERT INTO parking_slots
+            (id, floor_id, supported_vehicle_type)
+          VALUES
+            ('SLOT-001', 'FLOOR-001', 'Car');
+          ",
+          on: db,
+        )
+      Nil
+    }
+
+    False -> Nil
+  }
+
+  db
+}
+
+fn execute(db: sqlight.Connection, sql: String) {
+  let assert Ok(Nil) = sqlight.exec(sql, on: db)
+}
+
+fn count_rows(db: sqlight.Connection, table: String) -> Int {
+  let assert Ok([count]) =
+    sqlight.query(
+      "SELECT COUNT(*) FROM " <> table <> ";",
+      on: db,
+      with: [],
+      expecting: decode.field(0, decode.int, fn(value) { decode.success(value) }),
+    )
+
+  count
+}
+
+fn get_session_state(db: sqlight.Connection) -> String {
+  let assert Ok([state]) =
+    sqlight.query(
+      "SELECT state FROM parking_sessions WHERE id = 'SESSION-001';",
+      on: db,
+      with: [],
+      expecting: decode.field(0, decode.string, fn(value) {
+        decode.success(value)
+      }),
+    )
+
+  state
+}
+
+fn make_vehicle(
+  id: String,
+  plate_number: String,
+  vehicle_type: vehicle.VehicleType,
+) -> vehicle.Vehicle {
+  let assert Ok(vehicle_id) = vehicle.new_vehicle_id(id)
+  let assert Ok(plate) = vehicle.new_plate_number(plate_number)
+
+  vehicle.new_vehicle(vehicle_id, plate, vehicle_type)
+}
+
+fn make_request(
+  candidate_vehicle: vehicle.Vehicle,
+) -> entry_parking.EntryParkingRequest {
+  let assert Ok(session_id) =
+    parking_session.new_parking_session_id("SESSION-001")
+
+  let assert Ok(ticket_id) = parking_ticket.new_parking_ticket_id("TICKET-001")
+
+  entry_parking.EntryParkingRequest(
+    session_id: session_id,
+    ticket_id: ticket_id,
+    vehicle: candidate_vehicle,
+    entry_time: 1000,
+  )
+}
+
+fn make_car() -> vehicle.Vehicle {
+  make_vehicle("VEHICLE-001", "B 1234 ABC", vehicle.Car)
+}
+
+fn close_database(db: sqlight.Connection) {
+  let assert Ok(Nil) = sqlight.close(db)
+}
+
+// MARK: Successful Entry
+
+pub fn successful_entry_persists_vehicle_session_and_ticket_test() {
+  let db = setup_database(True)
+  let transaction = sqlite_entry_parking_transaction.new(db)
+  let request = make_request(make_car())
+
+  let result = sqlite_entry_parking_transaction.enter(transaction, request)
+
+  case result {
+    Ok(entry_result) -> {
+      should.equal(
+        parking_session.get_parking_session_id_value(
+          parking_session.get_parking_session_id(entry_result.session),
+        ),
+        "SESSION-001",
+      )
+
+      should.equal(
+        parking_ticket.get_parking_ticket_id_value(
+          parking_ticket.get_parking_ticket_id(entry_result.ticket),
+        ),
+        "TICKET-001",
+      )
+
+      should.equal(
+        parking_slot.get_parking_slot_id_value(parking_slot.get_parking_slot_id(
+          entry_result.slot,
+        )),
+        "SLOT-001",
+      )
+    }
+
+    Error(_) -> should.fail()
+  }
+
+  count_rows(db, "vehicles")
+  |> should.equal(1)
+
+  count_rows(db, "parking_sessions")
+  |> should.equal(1)
+
+  count_rows(db, "parking_tickets")
+  |> should.equal(1)
+
+  get_session_state(db)
+  |> should.equal("Active")
+
+  close_database(db)
+}
+
+// MARK: Existing Vehicle
+
+pub fn existing_vehicle_is_not_duplicated_test() {
+  let db = setup_database(True)
+
+  let _ =
+    execute(
+      db,
+      "
+      INSERT INTO vehicles (id, plate_number, vehicle_type)
+      VALUES ('VEHICLE-001', 'B 1234 ABC', 'Car');
+      ",
+    )
+
+  let transaction = sqlite_entry_parking_transaction.new(db)
+  let request = make_request(make_car())
+
+  let result = sqlite_entry_parking_transaction.enter(transaction, request)
+
+  case result {
+    Ok(_) -> Nil
+    Error(_) -> should.fail()
+  }
+
+  count_rows(db, "vehicles")
+  |> should.equal(1)
+
+  count_rows(db, "parking_sessions")
+  |> should.equal(1)
+
+  count_rows(db, "parking_tickets")
+  |> should.equal(1)
+
+  close_database(db)
+}
+
+// MARK: Vehicle Identity Conflict
+
+pub fn vehicle_identity_conflict_rejects_entry_test() {
+  let db = setup_database(True)
+
+  let _ =
+    execute(
+      db,
+      "
+      INSERT INTO vehicles (id, plate_number, vehicle_type)
+      VALUES ('VEHICLE-001', 'B 1234 ABC', 'Car');
+      ",
+    )
+
+  let transaction = sqlite_entry_parking_transaction.new(db)
+
+  let conflicting_vehicle =
+    make_vehicle("VEHICLE-001", "B 9999 XYZ", vehicle.Car)
+
+  let request = make_request(conflicting_vehicle)
+
+  let result = sqlite_entry_parking_transaction.enter(transaction, request)
+
+  case result {
+    Error(entry_parking_transaction.RepositoryFailed(repository_error.StorageError(
+      _,
+    ))) -> Nil
+
+    Error(_) -> should.fail()
+    Ok(_) -> should.fail()
+  }
+
+  count_rows(db, "vehicles")
+  |> should.equal(1)
+
+  count_rows(db, "parking_sessions")
+  |> should.equal(0)
+
+  count_rows(db, "parking_tickets")
+  |> should.equal(0)
+
+  close_database(db)
+}
+
+// MARK: No Available Slot
+
+pub fn no_available_slot_rolls_back_vehicle_test() {
+  let db = setup_database(False)
+  let transaction = sqlite_entry_parking_transaction.new(db)
+  let request = make_request(make_car())
+
+  let result = sqlite_entry_parking_transaction.enter(transaction, request)
+
+  case result {
+    Error(entry_parking_transaction.EntryFailed(
+      entry_parking.NoAvailableParkingSlot,
+    )) -> Nil
+
+    Error(_) -> should.fail()
+    Ok(_) -> should.fail()
+  }
+
+  // Vehicle persistence happens before slot allocation.
+  // The failed use case must roll back that INSERT.
+  count_rows(db, "vehicles")
+  |> should.equal(0)
+
+  count_rows(db, "parking_sessions")
+  |> should.equal(0)
+
+  count_rows(db, "parking_tickets")
+  |> should.equal(0)
+
+  close_database(db)
+}
+
+// MARK: Session Persistence Failure
+
+pub fn failed_session_insert_rolls_back_vehicle_test() {
+  let db = setup_database(True)
+
+  let _ =
+    execute(
+      db,
+      "
+      CREATE TRIGGER reject_session_insert
+      BEFORE INSERT ON parking_sessions
+      BEGIN
+        SELECT RAISE(ABORT, 'Simulated session insert failure');
+      END;
+      ",
+    )
+
+  let transaction = sqlite_entry_parking_transaction.new(db)
+  let request = make_request(make_car())
+
+  let result = sqlite_entry_parking_transaction.enter(transaction, request)
+
+  case result {
+    Error(entry_parking_transaction.RepositoryFailed(repository_error.StorageError(
+      _,
+    ))) -> Nil
+
+    Error(_) -> should.fail()
+    Ok(_) -> should.fail()
+  }
+
+  // Vehicle INSERT must be rolled back.
+  count_rows(db, "vehicles")
+  |> should.equal(0)
+
+  count_rows(db, "parking_sessions")
+  |> should.equal(0)
+
+  count_rows(db, "parking_tickets")
+  |> should.equal(0)
+
+  close_database(db)
+}
+
+// MARK: Ticket Persistence Failure
+
+pub fn failed_ticket_insert_rolls_back_vehicle_and_session_test() {
+  let db = setup_database(True)
+
+  let _ =
+    execute(
+      db,
+      "
+      CREATE TRIGGER reject_ticket_insert
+      BEFORE INSERT ON parking_tickets
+      BEGIN
+        SELECT RAISE(ABORT, 'Simulated ticket insert failure');
+      END;
+      ",
+    )
+
+  let transaction = sqlite_entry_parking_transaction.new(db)
+  let request = make_request(make_car())
+
+  let result = sqlite_entry_parking_transaction.enter(transaction, request)
+
+  case result {
+    Error(entry_parking_transaction.RepositoryFailed(repository_error.StorageError(
+      _,
+    ))) -> Nil
+
+    Error(_) -> should.fail()
+    Ok(_) -> should.fail()
+  }
+
+  // Both earlier INSERT operations must be rolled back.
+  count_rows(db, "vehicles")
+  |> should.equal(0)
+
+  count_rows(db, "parking_sessions")
+  |> should.equal(0)
+
+  count_rows(db, "parking_tickets")
+  |> should.equal(0)
+
+  close_database(db)
+}
+
+
+============================================================
+FILE: test/infrastructure/sqlite_exit_parking_transaction_test.gleam
+============================================================
+import application/exit_parking
+import application/ports/exit_parking_transaction
+import application/ports/repository_error
+import domain/parking_session
+import domain/payment
+import gleam/dynamic/decode
+import gleam/option.{type Option, None, Some}
+import gleeunit/should
+import infrastructure/sqlite_connection
+import infrastructure/sqlite_exit_parking_transaction
+import simplifile
+import sqlight
+
+// MARK: Test Helpers
+
+fn setup_database() -> sqlight.Connection {
+  let assert Ok(db) = sqlite_connection.connect_to(":memory:")
+
+  let assert Ok(initial_migration) =
+    simplifile.read(
+      from: "priv/repo/migrations/001_create_parking_schema.up.sql",
+    )
+
+  let assert Ok(Nil) = sqlight.exec(initial_migration, on: db)
+
+  let assert Ok(payment_migration) =
+    simplifile.read(from: "priv/repo/migrations/002_create_payments.up.sql")
+
+  let assert Ok(Nil) = sqlight.exec(payment_migration, on: db)
+
+  let assert Ok(Nil) =
+    sqlight.exec(
+      "
+      INSERT INTO vehicles (id, plate_number, vehicle_type)
+      VALUES ('VEHICLE-001', 'B 1234 ABC', 'Car');
+
+      INSERT INTO parking_floors (id)
+      VALUES ('FLOOR-001');
+
+      INSERT INTO parking_slots (id, floor_id, supported_vehicle_type)
+      VALUES ('SLOT-001', 'FLOOR-001', 'Car');
+
+      INSERT INTO parking_sessions
+        (id, vehicle_id, slot_id, entry_time, exit_time, state)
+      VALUES
+        ('SESSION-001', 'VEHICLE-001', 'SLOT-001', 1000, NULL, 'Active');
+      ",
+      on: db,
+    )
+
+  db
+}
+
+fn execute(db: sqlight.Connection, sql: String) {
+  let assert Ok(Nil) = sqlight.exec(sql, on: db)
+}
+
+fn count_rows(db: sqlight.Connection, table: String) -> Int {
+  let assert Ok([count]) =
+    sqlight.query(
+      "SELECT COUNT(*) FROM " <> table <> ";",
+      on: db,
+      with: [],
+      expecting: decode.field(0, decode.int, fn(value) { decode.success(value) }),
+    )
+
+  count
+}
+
+fn get_session_state(db: sqlight.Connection) -> String {
+  let assert Ok([state]) =
+    sqlight.query(
+      "SELECT state FROM parking_sessions WHERE id = 'SESSION-001';",
+      on: db,
+      with: [],
+      expecting: decode.field(0, decode.string, fn(value) {
+        decode.success(value)
+      }),
+    )
+
+  state
+}
+
+fn get_payment_status(db: sqlight.Connection) -> String {
+  let assert Ok([status]) =
+    sqlight.query(
+      "SELECT status FROM payments WHERE id = 'PAYMENT-001';",
+      on: db,
+      with: [],
+      expecting: decode.field(0, decode.string, fn(value) {
+        decode.success(value)
+      }),
+    )
+
+  status
+}
+
+fn make_request(
+  payment_id: Option(payment.PaymentId),
+  exit_time: Int,
+  hourly_rate: Int,
+) -> exit_parking.ExitParkingRequest {
+  let assert Ok(session_id) =
+    parking_session.new_parking_session_id("SESSION-001")
+
+  exit_parking.ExitParkingRequest(
+    session_id: session_id,
+    payment_id: payment_id,
+    exit_time: exit_time,
+    hourly_rate: hourly_rate,
+    payment_method: payment.Cash,
+  )
+}
+
+fn make_payment_id() -> payment.PaymentId {
+  let assert Ok(id) = payment.new_payment_id("PAYMENT-001")
+  id
+}
+
+fn close_database(db: sqlight.Connection) {
+  let assert Ok(Nil) = sqlight.close(db)
+}
+
+// MARK: Successful Transaction
+
+pub fn successful_exit_persists_payment_and_closed_session_test() {
+  let db = setup_database()
+  let transaction = sqlite_exit_parking_transaction.new(db)
+
+  let request = make_request(Some(make_payment_id()), 4600, 5000)
+
+  let result = sqlite_exit_parking_transaction.exit(transaction, request)
+
+  case result {
+    Ok(exit_result) -> {
+      should.equal(exit_result.fee, 5000)
+      should.equal(exit_result.duration_seconds, 3600)
+
+      should.equal(
+        parking_session.get_parking_session_state(exit_result.session),
+        parking_session.Closed(4600),
+      )
+
+      case exit_result.payment {
+        Some(saved_payment) ->
+          should.equal(
+            payment.get_payment_status(saved_payment),
+            payment.Succeeded,
+          )
+
+        None -> should.fail()
+      }
+    }
+
+    Error(_) -> should.fail()
+  }
+
+  count_rows(db, "payments")
+  |> should.equal(1)
+
+  get_payment_status(db)
+  |> should.equal("Succeeded")
+
+  get_session_state(db)
+  |> should.equal("Closed")
+
+  close_database(db)
+}
+
+// MARK: Zero Fee
+
+pub fn zero_fee_exit_closes_session_without_payment_test() {
+  let db = setup_database()
+  let transaction = sqlite_exit_parking_transaction.new(db)
+
+  let request = make_request(None, 1000, 5000)
+
+  let result = sqlite_exit_parking_transaction.exit(transaction, request)
+
+  case result {
+    Ok(exit_result) -> {
+      should.equal(exit_result.fee, 0)
+      should.equal(exit_result.payment, None)
+
+      should.equal(
+        parking_session.get_parking_session_state(exit_result.session),
+        parking_session.Closed(1000),
+      )
+    }
+
+    Error(_) -> should.fail()
+  }
+
+  count_rows(db, "payments")
+  |> should.equal(0)
+
+  get_session_state(db)
+  |> should.equal("Closed")
+
+  close_database(db)
+}
+
+// MARK: Session Not Found
+
+pub fn missing_session_returns_session_not_found_test() {
+  let db = setup_database()
+  let transaction = sqlite_exit_parking_transaction.new(db)
+
+  let assert Ok(session_id) =
+    parking_session.new_parking_session_id("SESSION-MISSING")
+
+  let request =
+    exit_parking.ExitParkingRequest(
+      session_id: session_id,
+      payment_id: Some(make_payment_id()),
+      exit_time: 4600,
+      hourly_rate: 5000,
+      payment_method: payment.Cash,
+    )
+
+  let result = sqlite_exit_parking_transaction.exit(transaction, request)
+
+  case result {
+    Error(exit_parking_transaction.ExitFailed(exit_parking.SessionNotFound)) ->
+      Nil
+
+    Error(_) -> should.fail()
+    Ok(_) -> should.fail()
+  }
+
+  count_rows(db, "payments")
+  |> should.equal(0)
+
+  get_session_state(db)
+  |> should.equal("Active")
+
+  close_database(db)
+}
+
+// MARK: Missing Payment ID
+
+pub fn missing_payment_id_rolls_back_exit_test() {
+  let db = setup_database()
+  let transaction = sqlite_exit_parking_transaction.new(db)
+
+  let request = make_request(None, 4600, 5000)
+
+  let result = sqlite_exit_parking_transaction.exit(transaction, request)
+
+  case result {
+    Error(exit_parking_transaction.ExitFailed(exit_parking.MissingPaymentId)) ->
+      Nil
+
+    Error(_) -> should.fail()
+    Ok(_) -> should.fail()
+  }
+
+  count_rows(db, "payments")
+  |> should.equal(0)
+
+  get_session_state(db)
+  |> should.equal("Active")
+
+  close_database(db)
+}
+
+// MARK: Already Closed Session
+
+pub fn closed_session_cannot_exit_again_test() {
+  let db = setup_database()
+
+  let _ =
+    execute(
+      db,
+      "
+    UPDATE parking_sessions
+    SET exit_time = 2000, state = 'Closed'
+    WHERE id = 'SESSION-001';
+    ",
+    )
+
+  let transaction = sqlite_exit_parking_transaction.new(db)
+  let request = make_request(Some(make_payment_id()), 3000, 5000)
+
+  let result = sqlite_exit_parking_transaction.exit(transaction, request)
+
+  case result {
+    Error(exit_parking_transaction.ExitFailed(exit_parking.SessionClosingFailed(
+      parking_session.ParkingSessionAlreadyClosed,
+    ))) -> Nil
+
+    Error(_) -> should.fail()
+    Ok(_) -> should.fail()
+  }
+
+  count_rows(db, "payments")
+  |> should.equal(0)
+
+  get_session_state(db)
+  |> should.equal("Closed")
+
+  close_database(db)
+}
+
+// MARK: Atomic Rollback
+
+pub fn failed_session_update_rolls_back_payment_test() {
+  let db = setup_database()
+
+  // Payment persistence happens before session persistence.
+  // This trigger forces the second operation to fail.
+  let _ =
+    execute(
+      db,
+      "
+    CREATE TRIGGER reject_session_exit
+    BEFORE UPDATE ON parking_sessions
+    BEGIN
+      SELECT RAISE(ABORT, 'Simulated session update failure');
+    END;
+    ",
+    )
+
+  let transaction = sqlite_exit_parking_transaction.new(db)
+  let request = make_request(Some(make_payment_id()), 4600, 5000)
+
+  let result = sqlite_exit_parking_transaction.exit(transaction, request)
+
+  case result {
+    Error(exit_parking_transaction.RepositoryFailed(repository_error.StorageError(
+      _,
+    ))) -> Nil
+
+    Error(_) -> should.fail()
+    Ok(_) -> should.fail()
+  }
+
+  // The payment INSERT must be rolled back as well.
+  count_rows(db, "payments")
+  |> should.equal(0)
+
+  // The original session must remain active.
+  get_session_state(db)
+  |> should.equal("Active")
+
+  close_database(db)
+}
+
+
+============================================================
+FILE: test/infrastructure/sqlite_floor_repository_test.gleam
+============================================================
+import domain/floor
+import domain/parking_slot
+import domain/vehicle
+import gleam/list
+import gleeunit/should
+import infrastructure/sqlite_connection
+import infrastructure/sqlite_floor_repository
+import sqlight
+
+fn setup_database() -> sqlight.Connection {
+  let assert Ok(db) = sqlite_connection.connect_to(":memory:")
+
+  let assert Ok(Nil) =
+    sqlight.exec(
+      "
+    CREATE TABLE parking_floors (
+      id TEXT PRIMARY KEY NOT NULL
+    );
+
+    CREATE TABLE parking_slots (
+      id TEXT PRIMARY KEY NOT NULL,
+      floor_id TEXT NOT NULL,
+      supported_vehicle_type TEXT NOT NULL,
+      FOREIGN KEY (floor_id) REFERENCES parking_floors(id),
+      UNIQUE (floor_id, id)
+    );
+    ",
+      on: db,
+    )
+
+  db
+}
+
+fn execute(db: sqlight.Connection, sql: String) -> Nil {
+  let assert Ok(Nil) = sqlight.exec(sql, on: db)
+  Nil
+}
+
+fn floor_ids(floors: List(floor.ParkingFloor)) -> List(String) {
+  list.map(floors, fn(current_floor) {
+    current_floor
+    |> floor.get_parking_floor_id
+    |> floor.get_parking_floor_id_value
+  })
+}
+
+pub fn get_all_floors_empty_database_test() {
+  let db = setup_database()
+  let repository = sqlite_floor_repository.new(db)
+
+  sqlite_floor_repository.get_all_floors(repository)
+  |> should.equal(Ok([]))
+
+  let assert Ok(Nil) = sqlight.close(db)
+}
+
+pub fn get_all_floors_without_slots_test() {
+  let db = setup_database()
+
+  execute(
+    db,
+    "
+    INSERT INTO parking_floors (id)
+    VALUES ('FLOOR-01'), ('FLOOR-02'), ('FLOOR-03');
+    ",
+  )
+
+  let repository = sqlite_floor_repository.new(db)
+
+  let assert Ok(floors) = sqlite_floor_repository.get_all_floors(repository)
+
+  floor_ids(floors)
+  |> should.equal(["FLOOR-01", "FLOOR-02", "FLOOR-03"])
+
+  list.map(floors, floor.get_parking_floor_slot_count)
+  |> should.equal([0, 0, 0])
+
+  let assert Ok(Nil) = sqlight.close(db)
+}
+
+pub fn get_all_floors_with_slots_test() {
+  let db = setup_database()
+
+  execute(
+    db,
+    "
+    INSERT INTO parking_floors (id)
+    VALUES ('FLOOR-01'), ('FLOOR-02'), ('FLOOR-03');
+
+    INSERT INTO parking_slots (id, floor_id, supported_vehicle_type)
+    VALUES
+      ('SLOT-01', 'FLOOR-01', 'Motorcycle'),
+      ('SLOT-02', 'FLOOR-01', 'Car'),
+      ('SLOT-03', 'FLOOR-02', 'Truck');
+    ",
+  )
+
+  let repository = sqlite_floor_repository.new(db)
+
+  let assert Ok(floors) = sqlite_floor_repository.get_all_floors(repository)
+
+  floor_ids(floors)
+  |> should.equal(["FLOOR-01", "FLOOR-02", "FLOOR-03"])
+
+  list.map(floors, floor.get_parking_floor_slot_count)
+  |> should.equal([2, 1, 0])
+
+  let assert [first_floor, second_floor, third_floor] = floors
+
+  first_floor
+  |> floor.get_parking_floor_slots
+  |> list.map(parking_slot.get_supported_vehicle_type)
+  |> should.equal([vehicle.Motorcycle, vehicle.Car])
+
+  second_floor
+  |> floor.get_parking_floor_slots
+  |> list.map(parking_slot.get_supported_vehicle_type)
+  |> should.equal([vehicle.Truck])
+
+  third_floor
+  |> floor.get_parking_floor_slots
+  |> should.equal([])
+
+  let assert Ok(Nil) = sqlight.close(db)
+}
+
+
+============================================================
+FILE: test/infrastructure/sqlite_session_repository_test.gleam
+============================================================
+import domain/parking_session
+import domain/parking_slot
+import domain/vehicle
+import gleam/list
+import gleam/option.{None}
+import gleeunit/should
+import infrastructure/sqlite_connection
+import infrastructure/sqlite_session_repository
+import sqlight
+
+fn setup_database() -> sqlight.Connection {
+  let assert Ok(db) = sqlite_connection.connect_to(":memory:")
+
+  let assert Ok(Nil) =
+    sqlight.exec(
+      "
+    CREATE TABLE parking_sessions (
+      id TEXT PRIMARY KEY NOT NULL,
+      vehicle_id TEXT NOT NULL,
+      slot_id TEXT NOT NULL,
+      entry_time INTEGER NOT NULL,
+      exit_time INTEGER,
+      state TEXT NOT NULL
+    );
+    ",
+      on: db,
+    )
+
+  db
+}
+
+fn execute(db: sqlight.Connection, sql: String) -> Nil {
+  let assert Ok(Nil) = sqlight.exec(sql, on: db)
+  Nil
+}
+
+pub fn get_active_sessions_empty_database_test() {
+  let db = setup_database()
+  let repository = sqlite_session_repository.new(db)
+
+  sqlite_session_repository.get_active_sessions(repository)
+  |> should.equal(Ok([]))
+
+  let assert Ok(Nil) = sqlight.close(db)
+}
+
+pub fn get_active_sessions_only_returns_active_test() {
+  let db = setup_database()
+
+  execute(
+    db,
+    "
+    INSERT INTO parking_sessions
+      (id, vehicle_id, slot_id, entry_time, exit_time, state)
+    VALUES
+      ('SESSION-01', 'VEHICLE-01', 'SLOT-01', 1000, NULL, 'Active'),
+      ('SESSION-02', 'VEHICLE-02', 'SLOT-02', 2000, 3000, 'Closed'),
+      ('SESSION-03', 'VEHICLE-03', 'SLOT-03', 1500, NULL, 'Active');
+    ",
+  )
+
+  let repository = sqlite_session_repository.new(db)
+
+  let assert Ok(sessions) =
+    sqlite_session_repository.get_active_sessions(repository)
+
+  list.length(sessions)
+  |> should.equal(2)
+
+  let assert [first_session, second_session] = sessions
+
+  first_session
+  |> parking_session.get_parking_session_id
+  |> parking_session.get_parking_session_id_value
+  |> should.equal("SESSION-01")
+
+  second_session
+  |> parking_session.get_parking_session_id
+  |> parking_session.get_parking_session_id_value
+  |> should.equal("SESSION-03")
+
+  let assert parking_session.Active =
+    parking_session.get_parking_session_state(first_session)
+
+  let assert parking_session.Active =
+    parking_session.get_parking_session_state(second_session)
+
+  let assert Ok(Nil) = sqlight.close(db)
+}
+
+pub fn get_active_sessions_maps_domain_fields_test() {
+  let db = setup_database()
+
+  execute(
+    db,
+    "
+    INSERT INTO parking_sessions
+      (id, vehicle_id, slot_id, entry_time, exit_time, state)
+    VALUES
+      ('SESSION-01', 'VEHICLE-01', 'SLOT-01', 12345, NULL, 'Active');
+    ",
+  )
+
+  let repository = sqlite_session_repository.new(db)
+
+  let assert Ok([session]) =
+    sqlite_session_repository.get_active_sessions(repository)
+
+  parking_session.get_parking_session_id(session)
+  |> parking_session.get_parking_session_id_value
+  |> should.equal("SESSION-01")
+
+  parking_session.get_parking_session_vehicle_id(session)
+  |> vehicle.get_vehicle_id_value
+  |> should.equal("VEHICLE-01")
+
+  parking_session.get_parking_session_slot_id(session)
+  |> parking_slot.get_parking_slot_id_value
+  |> should.equal("SLOT-01")
+
+  parking_session.get_parking_session_entry_time(session)
+  |> should.equal(12_345)
+
+  parking_session.get_parking_session_state(session)
+  |> should.equal(parking_session.Active)
+
+  parking_session.get_parking_session_exit_time(session)
+  |> should.equal(None)
+
+  let assert Ok(Nil) = sqlight.close(db)
+}
+
+
+============================================================
+FILE: test/infrastructure/sqlite/sqlite_connection_test.gleam
+============================================================
+import gleeunit/should
+import infrastructure/sqlite_connection as connection
+import sqlight
+
+pub fn connect_opens_database_test() {
+  let assert Ok(db) = connection.connect()
+
+  let assert Ok(_) = sqlight.exec("SELECT 1;", on: db)
+
+  let assert Ok(Nil) = sqlight.close(db)
+
+  should.be_ok(Ok(Nil))
+}
+
+pub fn foreign_keys_are_enabled_test() {
+  let assert Ok(db) = connection.connect()
+
+  let assert Ok(_) =
+    sqlight.exec(
+      "CREATE TABLE IF NOT EXISTS connection_test_parent (
+        id INTEGER PRIMARY KEY
+      );",
+      on: db,
+    )
+
+  let assert Ok(_) =
+    sqlight.exec(
+      "CREATE TABLE IF NOT EXISTS connection_test_child (
+        parent_id INTEGER NOT NULL,
+        FOREIGN KEY (parent_id)
+          REFERENCES connection_test_parent(id)
+      );",
+      on: db,
+    )
+
+  let result =
+    sqlight.exec(
+      "INSERT INTO connection_test_child (parent_id) VALUES (999999);",
+      on: db,
+    )
+
+  let assert Error(_) = result
+
+  let assert Ok(Nil) = sqlight.exec("DROP TABLE connection_test_child;", on: db)
+
+  let assert Ok(Nil) =
+    sqlight.exec("DROP TABLE connection_test_parent;", on: db)
+
+  let assert Ok(Nil) = sqlight.close(db)
+}
+
+
+============================================================
+FILE: test/infrastructure/sqlite/sqlite_migration_test.gleam
+============================================================
+import gleam/dynamic/decode
+import gleam/list
+import gleeunit/should
+import infrastructure/sqlite_connection as connection
+import infrastructure/sqlite_migration as migration
+import simplifile
+import sqlight
+
+const migrations_dir = "priv/repo/migrations"
+
+const initial_migration_name = "001_create_parking_schema"
+
+fn table_exists(db: sqlight.Connection, table_name: String) -> Bool {
+  let assert Ok(rows) =
+    sqlight.query(
+      "
+      SELECT name
+      FROM sqlite_master
+      WHERE type = 'table'
+        AND name = ?;
+      ",
+      on: db,
+      with: [sqlight.text(table_name)],
+      expecting: decode.at([0], decode.string),
+    )
+
+  list.contains(rows, table_name)
+}
+
+fn migration_is_recorded(db: sqlight.Connection) -> Bool {
+  let assert Ok(names) =
+    sqlight.query(
+      "
+      SELECT name
+      FROM __migrations
+      WHERE name = ?;
+      ",
+      on: db,
+      with: [sqlight.text(initial_migration_name)],
+      expecting: decode.at([0], decode.string),
+    )
+
+  list.contains(names, initial_migration_name)
+}
+
+// MARK: New Database
+
+pub fn migrate_creates_schema_for_new_database_test() {
+  let assert Ok(db) = connection.connect_to(":memory:")
+
+  let assert Ok(Nil) = migration.migrate(db, migrations_dir)
+
+  table_exists(db, "parking_floors")
+  |> should.be_true
+
+  table_exists(db, "parking_slots")
+  |> should.be_true
+
+  table_exists(db, "vehicles")
+  |> should.be_true
+
+  table_exists(db, "parking_sessions")
+  |> should.be_true
+
+  table_exists(db, "parking_tickets")
+  |> should.be_true
+
+  table_exists(db, "__migrations")
+  |> should.be_true
+
+  migration_is_recorded(db)
+  |> should.be_true
+
+  let assert Ok(Nil) = sqlight.close(db)
+}
+
+// MARK: Legacy Database Adoption
+
+pub fn migrate_adopts_existing_legacy_schema_test() {
+  let assert Ok(db) = connection.connect_to(":memory:")
+
+  let assert Ok(schema_sql) =
+    simplifile.read("priv/repo/migrations/001_create_parking_schema.up.sql")
+
+  let assert Ok(Nil) = sqlight.exec(schema_sql, on: db)
+
+  let assert Ok(Nil) =
+    sqlight.exec(
+      "
+      CREATE TABLE schema_migrations (
+        version INTEGER PRIMARY KEY NOT NULL,
+        name TEXT NOT NULL,
+        applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+      );
+
+      INSERT INTO schema_migrations (version, name)
+      VALUES (1, '001_create_parking_schema.sql');
+      ",
+      on: db,
+    )
+
+  let assert Ok(Nil) = migration.migrate(db, migrations_dir)
+  let assert Ok(Nil) = migration.migrate(db, migrations_dir)
+
+  table_exists(db, "parking_floors")
+  |> should.be_true
+
+  table_exists(db, "parking_slots")
+  |> should.be_true
+
+  table_exists(db, "vehicles")
+  |> should.be_true
+
+  table_exists(db, "parking_sessions")
+  |> should.be_true
+
+  table_exists(db, "parking_tickets")
+  |> should.be_true
+
+  migration_is_recorded(db)
+  |> should.be_true
+
+  let assert Ok(names) =
+    sqlight.query(
+      "
+      SELECT name
+      FROM __migrations
+      WHERE name = ?;
+      ",
+      on: db,
+      with: [sqlight.text(initial_migration_name)],
+      expecting: decode.at([0], decode.string),
+    )
+
+  list.length(names)
+  |> should.equal(1)
+
+  let assert Ok(Nil) = sqlight.close(db)
+}
+
+// MARK: Partial Schema
+
+pub fn migrate_rejects_partial_schema_test() {
+  let assert Ok(db) = connection.connect_to(":memory:")
+
+  let assert Ok(Nil) =
+    sqlight.exec(
+      "
+      CREATE TABLE parking_floors (
+        id TEXT PRIMARY KEY NOT NULL
+      );
+      ",
+      on: db,
+    )
+
+  let assert Error(_) = migration.migrate(db, migrations_dir)
+
+  table_exists(db, "parking_floors")
+  |> should.be_true
+
+  table_exists(db, "parking_slots")
+  |> should.be_false
+
+  let assert Ok(Nil) = sqlight.close(db)
+}
+
+// MARK: Idempotency
+
+pub fn migrate_does_not_apply_existing_migration_twice_test() {
+  let assert Ok(db) = connection.connect_to(":memory:")
+
+  let assert Ok(Nil) = migration.migrate(db, migrations_dir)
+  let assert Ok(Nil) = migration.migrate(db, migrations_dir)
+
+  let assert Ok(names) =
+    sqlight.query(
+      "
+      SELECT name
+      FROM __migrations
+      WHERE name = ?;
+      ",
+      on: db,
+      with: [sqlight.text(initial_migration_name)],
+      expecting: decode.at([0], decode.string),
+    )
+
+  list.length(names)
+  |> should.equal(1)
+
+  let assert Ok(Nil) = sqlight.close(db)
+}
+
+pub fn migrate_rejects_migration_history_without_domain_schema_test() {
+  let assert Ok(db) = connection.connect_to(":memory:")
+
+  let assert Ok(Nil) =
+    sqlight.exec(
+      "
+      CREATE TABLE __migrations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      );
+
+      INSERT INTO __migrations (name)
+      VALUES ('001_create_parking_schema');
+      ",
+      on: db,
+    )
+
+  let assert Error(_) = migration.migrate(db, migrations_dir)
+
+  table_exists(db, "parking_floors")
+  |> should.be_false
+
+  table_exists(db, "parking_slots")
+  |> should.be_false
+
+  let assert Ok(Nil) = sqlight.close(db)
+}
+
+
+============================================================
+FILE: test/parking_lot_test.gleam
+============================================================
+import gleeunit
+
+pub fn main() {
+  gleeunit.main()
+}
