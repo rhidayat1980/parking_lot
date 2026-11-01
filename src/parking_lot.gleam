@@ -5,6 +5,7 @@ import domain/parking_slot
 import gleam/io
 import infrastructure/sqlite_database
 import infrastructure/sqlite_floor_repository
+import interface/cli/app
 
 pub fn main() -> Nil {
   case sqlite_database.connect() {
@@ -14,7 +15,10 @@ pub fn main() -> Nil {
         |> sqlite_floor_repository.to_port
 
       case seed_parking_layout.seed(floor_repository) {
-        Ok(Nil) -> io.println("Parking layout seeded successfully")
+        Ok(Nil) -> {
+          io.println("Parking layout seeded successfully")
+          app.run()
+        }
 
         Error(error) ->
           io.println(
@@ -23,8 +27,11 @@ pub fn main() -> Nil {
       }
     }
 
-    Error(repository_error.StorageError(message)) ->
-      io.println("Database initialization failed: " <> message)
+    Error(repository_error) ->
+      io.println(
+        "Database initialization failed: "
+        <> repository_error.error_message(repository_error),
+      )
   }
 }
 
@@ -41,7 +48,7 @@ fn seed_error_message(
     seed_parking_layout.FloorConfigurationFailed(domain_error) ->
       "Floor configuration failed: " <> floor.error_message(domain_error)
 
-    seed_parking_layout.RepositoryFailed(repository_error.StorageError(message)) ->
-      "Repository failed: " <> message
+    seed_parking_layout.RepositoryFailed(repository_error) ->
+      "Repository failed: " <> repository_error.error_message(repository_error)
   }
 }

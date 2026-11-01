@@ -33,6 +33,50 @@ pub fn to_port(
   })
 }
 
+// MARK: Transaction Commands
+
+fn begin_transaction(
+  db: sqlight.Connection,
+) -> Result(Nil, repository_error.RepositoryError) {
+  write_query(sqlight.exec("BEGIN IMMEDIATE;", on: db))
+}
+
+fn commit_transaction(
+  db: sqlight.Connection,
+) -> Result(Nil, repository_error.RepositoryError) {
+  write_query(sqlight.exec("COMMIT;", on: db))
+}
+
+fn rollback_transaction(
+  db: sqlight.Connection,
+) -> Result(Nil, repository_error.RepositoryError) {
+  write_query(sqlight.exec("ROLLBACK;", on: db))
+}
+
+// MARK: SQL Error Mapping
+
+fn read_query(
+  value: Result(a, sqlight.Error),
+) -> Result(a, repository_error.RepositoryError) {
+  case value {
+    Ok(value) -> Ok(value)
+
+    Error(sqlight.SqlightError(_, message, _)) ->
+      Error(repository_error.ReadFailed(message))
+  }
+}
+
+fn write_query(
+  value: Result(a, sqlight.Error),
+) -> Result(a, repository_error.RepositoryError) {
+  case value {
+    Ok(value) -> Ok(value)
+
+    Error(sqlight.SqlightError(_, message, _)) ->
+      Error(repository_error.WriteFailed(message))
+  }
+}
+
 // MARK: Enter Parking
 
 pub fn enter(
@@ -187,12 +231,12 @@ fn insert_vehicle_if_missing(
   plate_number: String,
   vehicle_type: String,
 ) -> Result(Nil, repository_error.RepositoryError) {
-  query_result(sqlight.query(
+  write_query(sqlight.query(
     "
-    INSERT INTO vehicles (id, plate_number, vehicle_type)
-    VALUES (?, ?, ?)
-    ON CONFLICT(id) DO NOTHING;
-    ",
+      INSERT INTO vehicles (id, plate_number, vehicle_type)
+      VALUES (?, ?, ?)
+      ON CONFLICT(id) DO NOTHING;
+      ",
     on: db,
     with: [
       sqlight.text(vehicle_id),
@@ -211,14 +255,14 @@ fn verify_vehicle_identity(
   vehicle_type: String,
 ) -> Result(Nil, repository_error.RepositoryError) {
   case
-    query_result(sqlight.query(
+    read_query(sqlight.query(
       "
-    SELECT COUNT(*)
-    FROM vehicles
-    WHERE id = ?
-      AND plate_number = ?
-      AND vehicle_type = ?;
-    ",
+        SELECT COUNT(*)
+        FROM vehicles
+        WHERE id = ?
+          AND plate_number = ?
+          AND vehicle_type = ?;
+        ",
       on: db,
       with: [
         sqlight.text(vehicle_id),
@@ -231,7 +275,7 @@ fn verify_vehicle_identity(
     Ok([1]) -> Ok(Nil)
 
     Ok(_) ->
-      Error(repository_error.StorageError(
+      Error(repository_error.InvalidPersistedData(
         "Vehicle ID already exists with different vehicle data",
       ))
 
@@ -270,12 +314,12 @@ fn persist_session(
 
   let entry_time = parking_session.get_parking_session_entry_time(session)
 
-  query_result(sqlight.query(
+  write_query(sqlight.query(
     "
-    INSERT INTO parking_sessions
-      (id, vehicle_id, slot_id, entry_time, exit_time, state)
-    VALUES (?, ?, ?, ?, NULL, 'Active');
-    ",
+      INSERT INTO parking_sessions
+        (id, vehicle_id, slot_id, entry_time, exit_time, state)
+      VALUES (?, ?, ?, ?, NULL, 'Active');
+      ",
     on: db,
     with: [
       sqlight.text(session_id),
@@ -306,11 +350,11 @@ fn persist_ticket(
 
   let issued_at = parking_ticket.get_parking_ticket_issued_at(ticket)
 
-  query_result(sqlight.query(
+  write_query(sqlight.query(
     "
-    INSERT INTO parking_tickets (id, session_id, issued_at)
-    VALUES (?, ?, ?);
-    ",
+      INSERT INTO parking_tickets (id, session_id, issued_at)
+      VALUES (?, ?, ?);
+      ",
     on: db,
     with: [
       sqlight.text(ticket_id),
@@ -320,37 +364,4 @@ fn persist_ticket(
     expecting: decode.string,
   ))
   |> result.map(fn(_) { Nil })
-}
-
-// MARK: Transaction Commands
-
-fn begin_transaction(
-  db: sqlight.Connection,
-) -> Result(Nil, repository_error.RepositoryError) {
-  query_result(sqlight.exec("BEGIN IMMEDIATE;", on: db))
-}
-
-fn commit_transaction(
-  db: sqlight.Connection,
-) -> Result(Nil, repository_error.RepositoryError) {
-  query_result(sqlight.exec("COMMIT;", on: db))
-}
-
-fn rollback_transaction(
-  db: sqlight.Connection,
-) -> Result(Nil, repository_error.RepositoryError) {
-  query_result(sqlight.exec("ROLLBACK;", on: db))
-}
-
-// MARK: SQL Error Mapping
-
-fn query_result(
-  value: Result(a, sqlight.Error),
-) -> Result(a, repository_error.RepositoryError) {
-  case value {
-    Ok(value) -> Ok(value)
-
-    Error(sqlight.SqlightError(_, message, _)) ->
-      Error(repository_error.StorageError(message))
-  }
 }

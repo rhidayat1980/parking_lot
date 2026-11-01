@@ -6,8 +6,8 @@ import sqlight
 
 const migrations_dir = "priv/repo/migrations"
 
-/// Open main database and make sure migrations done already
-/// use the same connection for migration and repository
+/// Open main database and make sure migrations are done already.
+/// Use the same connection for migration and repository.
 pub fn connect() -> Result(sqlight.Connection, repository_error.RepositoryError) {
   use db <- result.try(sqlite_connection.connect())
 
@@ -17,7 +17,7 @@ pub fn connect() -> Result(sqlight.Connection, repository_error.RepositoryError)
     Error(message) -> {
       let _ = sqlight.close(db)
 
-      Error(repository_error.StorageError(
+      Error(repository_error.WriteFailed(
         "Database migration failed: " <> message,
       ))
     }

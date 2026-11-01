@@ -273,10 +273,10 @@ pub fn closed_session_cannot_exit_again_test() {
     execute(
       db,
       "
-    UPDATE parking_sessions
-    SET exit_time = 2000, state = 'Closed'
-    WHERE id = 'SESSION-001';
-    ",
+      UPDATE parking_sessions
+      SET exit_time = 2000, state = 'Closed'
+      WHERE id = 'SESSION-001';
+      ",
     )
 
   let transaction = sqlite_exit_parking_transaction.new(db)
@@ -313,12 +313,12 @@ pub fn failed_session_update_rolls_back_payment_test() {
     execute(
       db,
       "
-    CREATE TRIGGER reject_session_exit
-    BEFORE UPDATE ON parking_sessions
-    BEGIN
-      SELECT RAISE(ABORT, 'Simulated session update failure');
-    END;
-    ",
+      CREATE TRIGGER reject_session_exit
+      BEFORE UPDATE ON parking_sessions
+      BEGIN
+        SELECT RAISE(ABORT, 'Simulated session update failure');
+      END;
+      ",
     )
 
   let transaction = sqlite_exit_parking_transaction.new(db)
@@ -327,7 +327,7 @@ pub fn failed_session_update_rolls_back_payment_test() {
   let result = sqlite_exit_parking_transaction.exit(transaction, request)
 
   case result {
-    Error(exit_parking_transaction.RepositoryFailed(repository_error.StorageError(
+    Error(exit_parking_transaction.RepositoryFailed(repository_error.WriteFailed(
       _,
     ))) -> Nil
 

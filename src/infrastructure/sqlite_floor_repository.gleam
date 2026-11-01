@@ -24,13 +24,13 @@ pub fn new(db: sqlight.Connection) -> SqliteFloorRepository {
 fn begin_transaction(
   db: sqlight.Connection,
 ) -> Result(Nil, repository_error.RepositoryError) {
-  query(sqlight.exec("BEGIN IMMEDIATE", on: db))
+  write_query(sqlight.exec("BEGIN IMMEDIATE", on: db))
 }
 
 fn commit_transaction(
   db: sqlight.Connection,
 ) -> Result(Nil, repository_error.RepositoryError) {
-  query(sqlight.exec("COMMIT", on: db))
+  write_query(sqlight.exec("COMMIT", on: db))
 }
 
 fn rollback_transaction(db: sqlight.Connection) -> Nil {
@@ -90,7 +90,7 @@ fn insert_floor_if_missing(
     <> escape_sql(floor_id)
     <> "') ON CONFLICT(id) DO NOTHING;"
 
-  query(sqlight.exec(sql, on: db))
+  write_query(sqlight.exec(sql, on: db))
 }
 
 fn save_slots(
@@ -134,7 +134,7 @@ fn save_slot(
     <> vehicle_type
     <> "') ON CONFLICT(id) DO NOTHING;"
 
-  use _ <- result.try(query(sqlight.exec(sql, on: db)))
+  use _ <- result.try(write_query(sqlight.exec(sql, on: db)))
 
   verify_slot_configuration(db, floor_id, slot_id, vehicle_type)
 }
@@ -152,7 +152,7 @@ fn verify_slot_configuration(
     <> "';"
 
   use rows <- result.try(
-    query(sqlight.query(
+    read_query(sqlight.query(
       sql,
       on: db,
       with: [],
@@ -169,13 +169,13 @@ fn verify_slot_configuration(
         True -> Ok(Nil)
 
         False ->
-          Error(repository_error.StorageError(
+          Error(repository_error.InvalidPersistedData(
             "Parking slot configuration conflict: " <> slot_id,
           ))
       }
 
     _ ->
-      Error(repository_error.StorageError(
+      Error(repository_error.InvalidPersistedData(
         "Unable to verify parking slot: " <> slot_id,
       ))
   }
@@ -241,7 +241,7 @@ pub fn get_all_floors(
 fn load_floor_ids(
   db: sqlight.Connection,
 ) -> Result(List(String), repository_error.RepositoryError) {
-  query(sqlight.query(
+  read_query(sqlight.query(
     "
     SELECT id
     FROM parking_floors
@@ -256,7 +256,7 @@ fn load_floor_ids(
 fn load_slot_data(
   db: sqlight.Connection,
 ) -> Result(List(#(String, String, String)), repository_error.RepositoryError) {
-  query(sqlight.query(
+  read_query(sqlight.query(
     "
     SELECT floor_id, id, supported_vehicle_type
     FROM parking_slots
@@ -292,7 +292,7 @@ fn build_floors(
     use floor_id <- result.try(case floor.new_parking_floor_id(id) {
       Ok(value) -> Ok(value)
       Error(error) ->
-        Error(repository_error.StorageError(floor.error_message(error)))
+        Error(repository_error.InvalidPersistedData(floor.error_message(error)))
     })
 
     Ok(list.append(floors, [floor.new_parking_floor(floor_id)]))
@@ -306,7 +306,9 @@ fn build_slot(
   use slot_id <- result.try(case parking_slot.new_parking_slot_id(id) {
     Ok(value) -> Ok(value)
     Error(error) ->
-      Error(repository_error.StorageError(parking_slot.error_message(error)))
+      Error(
+        repository_error.InvalidPersistedData(parking_slot.error_message(error)),
+      )
   })
 
   use supported_vehicle_type <- result.try(parse_vehicle_type(vehicle_type))
@@ -322,7 +324,7 @@ fn parse_vehicle_type(
     "Car" -> Ok(vehicle.Car)
     "Truck" -> Ok(vehicle.Truck)
     _ ->
-      Error(repository_error.StorageError(
+      Error(repository_error.InvalidPersistedData(
         "Unknown supported vehicle type: " <> value,
       ))
   }
@@ -365,7 +367,7 @@ fn add_slot_to_floors(
 
   case floor_exists {
     False ->
-      Error(repository_error.StorageError(
+      Error(repository_error.InvalidPersistedData(
         "Parking slot references an unknown floor: " <> floor_id,
       ))
 
@@ -387,7 +389,7 @@ fn add_slot_to_matching_floor(
     True ->
       floor.add_parking_slot(current_floor, slot)
       |> result.map_error(fn(error) {
-        repository_error.StorageError(floor.error_message(error))
+        repository_error.InvalidPersistedData(floor.error_message(error))
       })
 
     False -> Ok(current_floor)
@@ -398,13 +400,24 @@ fn add_slot_to_matching_floor(
 // Error mapping
 // -----------------------------------------------------------------------------
 
-fn query(
-  result: Result(a, sqlight.Error),
+fn read_query(
+  value: Result(a, sqlight.Error),
 ) -> Result(a, repository_error.RepositoryError) {
-  case result {
-    Ok(value) -> Ok(value)
+  case value {
+    Ok(result) -> Ok(result)
 
     Error(sqlight.SqlightError(_, message, _)) ->
-      Error(repository_error.StorageError(message))
+      Error(repository_error.ReadFailed(message))
+  }
+}
+
+fn write_query(
+  value: Result(a, sqlight.Error),
+) -> Result(a, repository_error.RepositoryError) {
+  case value {
+    Ok(result) -> Ok(result)
+
+    Error(sqlight.SqlightError(_, message, _)) ->
+      Error(repository_error.WriteFailed(message))
   }
 }

@@ -90,7 +90,7 @@ fn make_service(
 }
 
 fn make_storage_error() -> repository_error.RepositoryError {
-  repository_error.StorageError("database unavailable")
+  repository_error.WriteFailed("database unavailable")
 }
 
 fn make_failing_service(

@@ -14,8 +14,9 @@ pub type ExitParkingServiceError {
 
 pub fn error_message(error: ExitParkingServiceError) -> String {
   case error {
-    TransactionFailed(repository_error.StorageError(message)) ->
-      "Failed to complete parking exit: " <> message
+    TransactionFailed(repository_error) ->
+      "Failed to complete parking exit: "
+      <> repository_error.error_message(repository_error)
 
     ExitFailed(exit_error) -> exit_parking.error_message(exit_error)
 
@@ -47,9 +48,7 @@ fn transaction_error_message(
 }
 
 fn repository_error_message(error: repository_error.RepositoryError) -> String {
-  case error {
-    repository_error.StorageError(message) -> message
-  }
+  repository_error.error_message(error)
 }
 
 // MARK: Service Dependencies

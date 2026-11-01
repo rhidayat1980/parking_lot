@@ -224,7 +224,7 @@ pub fn vehicle_identity_conflict_rejects_entry_test() {
   let result = sqlite_entry_parking_transaction.enter(transaction, request)
 
   case result {
-    Error(entry_parking_transaction.RepositoryFailed(repository_error.StorageError(
+    Error(entry_parking_transaction.RepositoryFailed(repository_error.InvalidPersistedData(
       _,
     ))) -> Nil
 
@@ -299,7 +299,7 @@ pub fn failed_session_insert_rolls_back_vehicle_test() {
   let result = sqlite_entry_parking_transaction.enter(transaction, request)
 
   case result {
-    Error(entry_parking_transaction.RepositoryFailed(repository_error.StorageError(
+    Error(entry_parking_transaction.RepositoryFailed(repository_error.WriteFailed(
       _,
     ))) -> Nil
 
@@ -343,7 +343,7 @@ pub fn failed_ticket_insert_rolls_back_vehicle_and_session_test() {
   let result = sqlite_entry_parking_transaction.enter(transaction, request)
 
   case result {
-    Error(entry_parking_transaction.RepositoryFailed(repository_error.StorageError(
+    Error(entry_parking_transaction.RepositoryFailed(repository_error.WriteFailed(
       _,
     ))) -> Nil
 

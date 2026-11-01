@@ -193,7 +193,7 @@ fn persist_closed_session(
 
   case exit_time {
     option.None ->
-      Error(repository_error.StorageError(
+      Error(repository_error.InvalidPersistedData(
         "Cannot persist a closed session without an exit time",
       ))
 
@@ -222,7 +222,7 @@ fn persist_closed_session(
         Ok([saved_id]) if saved_id == session_id -> Ok(Nil)
 
         Ok(_) ->
-          Error(repository_error.StorageError(
+          Error(repository_error.WriteFailed(
             "Failed to persist closed parking session",
           ))
 
@@ -260,6 +260,6 @@ fn query_result(
     Ok(value) -> Ok(value)
 
     Error(sqlight.SqlightError(_, message, _)) ->
-      Error(repository_error.StorageError(message))
+      Error(repository_error.WriteFailed(message))
   }
 }

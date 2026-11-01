@@ -239,8 +239,9 @@ pub type EntryParkingServiceError {
 
 pub fn error_message(error: EntryParkingServiceError) -> String {
   case error {
-    TransactionFailed(repository_error.StorageError(message)) ->
-      "Failed to complete parking entry: " <> message
+    TransactionFailed(repository_error) ->
+      "Failed to complete parking entry: "
+      <> repository_error.error_message(repository_error)
 
     EntryFailed(entry_error) -> entry_parking.error_message(entry_error)
 
@@ -275,9 +276,7 @@ fn transaction_error_message(
 }
 
 fn repository_error_message(error: repository_error.RepositoryError) -> String {
-  case error {
-    repository_error.StorageError(message) -> message
-  }
+  repository_error.error_message(error)
 }
 
 // MARK: Service Dependencies
@@ -491,8 +490,9 @@ pub type ExitParkingServiceError {
 
 pub fn error_message(error: ExitParkingServiceError) -> String {
   case error {
-    TransactionFailed(repository_error.StorageError(message)) ->
-      "Failed to complete parking exit: " <> message
+    TransactionFailed(repository_error) ->
+      "Failed to complete parking exit: "
+      <> repository_error.error_message(repository_error)
 
     ExitFailed(exit_error) -> exit_parking.error_message(exit_error)
 
@@ -524,9 +524,7 @@ fn transaction_error_message(
 }
 
 fn repository_error_message(error: repository_error.RepositoryError) -> String {
-  case error {
-    repository_error.StorageError(message) -> message
-  }
+  repository_error.error_message(error)
 }
 
 // MARK: Service Dependencies
@@ -707,10 +705,18 @@ pub type PaymentRepository {
 ============================================================
 FILE: src/application/ports/repository_error.gleam
 ============================================================
-// Mark: Repository Errors
-
 pub type RepositoryError {
-  StorageError(String)
+  ReadFailed(String)
+  WriteFailed(String)
+  InvalidPersistedData(String)
+}
+
+pub fn error_message(error: RepositoryError) -> String {
+  case error {
+    ReadFailed(message) -> "Failed to read from repository: " <> message
+    WriteFailed(message) -> "Failed to write to repository: " <> message
+    InvalidPersistedData(message) -> "Invalid persisted data: " <> message
+  }
 }
 
 
@@ -1825,11 +1831,11 @@ pub fn connect_to(
         Ok(Nil) -> Ok(connection)
 
         Error(error) -> {
-          let storage_error = to_repository_error(error)
+          let repository_error = to_repository_error(error)
 
           case sqlight.close(connection) {
-            Ok(Nil) -> Error(storage_error)
-            Error(_) -> Error(storage_error)
+            Ok(Nil) -> Error(repository_error)
+            Error(_) -> Error(repository_error)
           }
         }
       }
@@ -1844,8 +1850,7 @@ fn to_repository_error(
   error: sqlight.Error,
 ) -> repository_error.RepositoryError {
   case error {
-    sqlight.SqlightError(_, message, _) ->
-      repository_error.StorageError(message)
+    sqlight.SqlightError(_, message, _) -> repository_error.ReadFailed(message)
   }
 }
 
@@ -1861,8 +1866,8 @@ import sqlight
 
 const migrations_dir = "priv/repo/migrations"
 
-/// Open main database and make sure migrations done already
-/// use the same connection for migration and repository
+/// Open main database and make sure migrations are done already.
+/// Use the same connection for migration and repository.
 pub fn connect() -> Result(sqlight.Connection, repository_error.RepositoryError) {
   use db <- result.try(sqlite_connection.connect())
 
@@ -1872,7 +1877,7 @@ pub fn connect() -> Result(sqlight.Connection, repository_error.RepositoryError)
     Error(message) -> {
       let _ = sqlight.close(db)
 
-      Error(repository_error.StorageError(
+      Error(repository_error.WriteFailed(
         "Database migration failed: " <> message,
       ))
     }
@@ -1916,6 +1921,50 @@ pub fn to_port(
   entry_parking_transaction.EntryParkingTransaction(enter: fn(request) {
     enter(repository, request)
   })
+}
+
+// MARK: Transaction Commands
+
+fn begin_transaction(
+  db: sqlight.Connection,
+) -> Result(Nil, repository_error.RepositoryError) {
+  write_query(sqlight.exec("BEGIN IMMEDIATE;", on: db))
+}
+
+fn commit_transaction(
+  db: sqlight.Connection,
+) -> Result(Nil, repository_error.RepositoryError) {
+  write_query(sqlight.exec("COMMIT;", on: db))
+}
+
+fn rollback_transaction(
+  db: sqlight.Connection,
+) -> Result(Nil, repository_error.RepositoryError) {
+  write_query(sqlight.exec("ROLLBACK;", on: db))
+}
+
+// MARK: SQL Error Mapping
+
+fn read_query(
+  value: Result(a, sqlight.Error),
+) -> Result(a, repository_error.RepositoryError) {
+  case value {
+    Ok(value) -> Ok(value)
+
+    Error(sqlight.SqlightError(_, message, _)) ->
+      Error(repository_error.ReadFailed(message))
+  }
+}
+
+fn write_query(
+  value: Result(a, sqlight.Error),
+) -> Result(a, repository_error.RepositoryError) {
+  case value {
+    Ok(value) -> Ok(value)
+
+    Error(sqlight.SqlightError(_, message, _)) ->
+      Error(repository_error.WriteFailed(message))
+  }
 }
 
 // MARK: Enter Parking
@@ -2072,12 +2121,12 @@ fn insert_vehicle_if_missing(
   plate_number: String,
   vehicle_type: String,
 ) -> Result(Nil, repository_error.RepositoryError) {
-  query_result(sqlight.query(
+  write_query(sqlight.query(
     "
-    INSERT INTO vehicles (id, plate_number, vehicle_type)
-    VALUES (?, ?, ?)
-    ON CONFLICT(id) DO NOTHING;
-    ",
+      INSERT INTO vehicles (id, plate_number, vehicle_type)
+      VALUES (?, ?, ?)
+      ON CONFLICT(id) DO NOTHING;
+      ",
     on: db,
     with: [
       sqlight.text(vehicle_id),
@@ -2096,14 +2145,14 @@ fn verify_vehicle_identity(
   vehicle_type: String,
 ) -> Result(Nil, repository_error.RepositoryError) {
   case
-    query_result(sqlight.query(
+    read_query(sqlight.query(
       "
-    SELECT COUNT(*)
-    FROM vehicles
-    WHERE id = ?
-      AND plate_number = ?
-      AND vehicle_type = ?;
-    ",
+        SELECT COUNT(*)
+        FROM vehicles
+        WHERE id = ?
+          AND plate_number = ?
+          AND vehicle_type = ?;
+        ",
       on: db,
       with: [
         sqlight.text(vehicle_id),
@@ -2116,7 +2165,7 @@ fn verify_vehicle_identity(
     Ok([1]) -> Ok(Nil)
 
     Ok(_) ->
-      Error(repository_error.StorageError(
+      Error(repository_error.InvalidPersistedData(
         "Vehicle ID already exists with different vehicle data",
       ))
 
@@ -2155,12 +2204,12 @@ fn persist_session(
 
   let entry_time = parking_session.get_parking_session_entry_time(session)
 
-  query_result(sqlight.query(
+  write_query(sqlight.query(
     "
-    INSERT INTO parking_sessions
-      (id, vehicle_id, slot_id, entry_time, exit_time, state)
-    VALUES (?, ?, ?, ?, NULL, 'Active');
-    ",
+      INSERT INTO parking_sessions
+        (id, vehicle_id, slot_id, entry_time, exit_time, state)
+      VALUES (?, ?, ?, ?, NULL, 'Active');
+      ",
     on: db,
     with: [
       sqlight.text(session_id),
@@ -2191,11 +2240,11 @@ fn persist_ticket(
 
   let issued_at = parking_ticket.get_parking_ticket_issued_at(ticket)
 
-  query_result(sqlight.query(
+  write_query(sqlight.query(
     "
-    INSERT INTO parking_tickets (id, session_id, issued_at)
-    VALUES (?, ?, ?);
-    ",
+      INSERT INTO parking_tickets (id, session_id, issued_at)
+      VALUES (?, ?, ?);
+      ",
     on: db,
     with: [
       sqlight.text(ticket_id),
@@ -2205,39 +2254,6 @@ fn persist_ticket(
     expecting: decode.string,
   ))
   |> result.map(fn(_) { Nil })
-}
-
-// MARK: Transaction Commands
-
-fn begin_transaction(
-  db: sqlight.Connection,
-) -> Result(Nil, repository_error.RepositoryError) {
-  query_result(sqlight.exec("BEGIN IMMEDIATE;", on: db))
-}
-
-fn commit_transaction(
-  db: sqlight.Connection,
-) -> Result(Nil, repository_error.RepositoryError) {
-  query_result(sqlight.exec("COMMIT;", on: db))
-}
-
-fn rollback_transaction(
-  db: sqlight.Connection,
-) -> Result(Nil, repository_error.RepositoryError) {
-  query_result(sqlight.exec("ROLLBACK;", on: db))
-}
-
-// MARK: SQL Error Mapping
-
-fn query_result(
-  value: Result(a, sqlight.Error),
-) -> Result(a, repository_error.RepositoryError) {
-  case value {
-    Ok(value) -> Ok(value)
-
-    Error(sqlight.SqlightError(_, message, _)) ->
-      Error(repository_error.StorageError(message))
-  }
 }
 
 
@@ -2439,7 +2455,7 @@ fn persist_closed_session(
 
   case exit_time {
     option.None ->
-      Error(repository_error.StorageError(
+      Error(repository_error.InvalidPersistedData(
         "Cannot persist a closed session without an exit time",
       ))
 
@@ -2468,7 +2484,7 @@ fn persist_closed_session(
         Ok([saved_id]) if saved_id == session_id -> Ok(Nil)
 
         Ok(_) ->
-          Error(repository_error.StorageError(
+          Error(repository_error.WriteFailed(
             "Failed to persist closed parking session",
           ))
 
@@ -2506,7 +2522,7 @@ fn query_result(
     Ok(value) -> Ok(value)
 
     Error(sqlight.SqlightError(_, message, _)) ->
-      Error(repository_error.StorageError(message))
+      Error(repository_error.WriteFailed(message))
   }
 }
 
@@ -2540,13 +2556,13 @@ pub fn new(db: sqlight.Connection) -> SqliteFloorRepository {
 fn begin_transaction(
   db: sqlight.Connection,
 ) -> Result(Nil, repository_error.RepositoryError) {
-  query(sqlight.exec("BEGIN IMMEDIATE", on: db))
+  write_query(sqlight.exec("BEGIN IMMEDIATE", on: db))
 }
 
 fn commit_transaction(
   db: sqlight.Connection,
 ) -> Result(Nil, repository_error.RepositoryError) {
-  query(sqlight.exec("COMMIT", on: db))
+  write_query(sqlight.exec("COMMIT", on: db))
 }
 
 fn rollback_transaction(db: sqlight.Connection) -> Nil {
@@ -2606,7 +2622,7 @@ fn insert_floor_if_missing(
     <> escape_sql(floor_id)
     <> "') ON CONFLICT(id) DO NOTHING;"
 
-  query(sqlight.exec(sql, on: db))
+  write_query(sqlight.exec(sql, on: db))
 }
 
 fn save_slots(
@@ -2650,7 +2666,7 @@ fn save_slot(
     <> vehicle_type
     <> "') ON CONFLICT(id) DO NOTHING;"
 
-  use _ <- result.try(query(sqlight.exec(sql, on: db)))
+  use _ <- result.try(write_query(sqlight.exec(sql, on: db)))
 
   verify_slot_configuration(db, floor_id, slot_id, vehicle_type)
 }
@@ -2668,7 +2684,7 @@ fn verify_slot_configuration(
     <> "';"
 
   use rows <- result.try(
-    query(sqlight.query(
+    read_query(sqlight.query(
       sql,
       on: db,
       with: [],
@@ -2685,13 +2701,13 @@ fn verify_slot_configuration(
         True -> Ok(Nil)
 
         False ->
-          Error(repository_error.StorageError(
+          Error(repository_error.InvalidPersistedData(
             "Parking slot configuration conflict: " <> slot_id,
           ))
       }
 
     _ ->
-      Error(repository_error.StorageError(
+      Error(repository_error.InvalidPersistedData(
         "Unable to verify parking slot: " <> slot_id,
       ))
   }
@@ -2757,7 +2773,7 @@ pub fn get_all_floors(
 fn load_floor_ids(
   db: sqlight.Connection,
 ) -> Result(List(String), repository_error.RepositoryError) {
-  query(sqlight.query(
+  read_query(sqlight.query(
     "
     SELECT id
     FROM parking_floors
@@ -2772,7 +2788,7 @@ fn load_floor_ids(
 fn load_slot_data(
   db: sqlight.Connection,
 ) -> Result(List(#(String, String, String)), repository_error.RepositoryError) {
-  query(sqlight.query(
+  read_query(sqlight.query(
     "
     SELECT floor_id, id, supported_vehicle_type
     FROM parking_slots
@@ -2808,7 +2824,7 @@ fn build_floors(
     use floor_id <- result.try(case floor.new_parking_floor_id(id) {
       Ok(value) -> Ok(value)
       Error(error) ->
-        Error(repository_error.StorageError(floor.error_message(error)))
+        Error(repository_error.InvalidPersistedData(floor.error_message(error)))
     })
 
     Ok(list.append(floors, [floor.new_parking_floor(floor_id)]))
@@ -2822,7 +2838,9 @@ fn build_slot(
   use slot_id <- result.try(case parking_slot.new_parking_slot_id(id) {
     Ok(value) -> Ok(value)
     Error(error) ->
-      Error(repository_error.StorageError(parking_slot.error_message(error)))
+      Error(
+        repository_error.InvalidPersistedData(parking_slot.error_message(error)),
+      )
   })
 
   use supported_vehicle_type <- result.try(parse_vehicle_type(vehicle_type))
@@ -2838,7 +2856,7 @@ fn parse_vehicle_type(
     "Car" -> Ok(vehicle.Car)
     "Truck" -> Ok(vehicle.Truck)
     _ ->
-      Error(repository_error.StorageError(
+      Error(repository_error.InvalidPersistedData(
         "Unknown supported vehicle type: " <> value,
       ))
   }
@@ -2881,7 +2899,7 @@ fn add_slot_to_floors(
 
   case floor_exists {
     False ->
-      Error(repository_error.StorageError(
+      Error(repository_error.InvalidPersistedData(
         "Parking slot references an unknown floor: " <> floor_id,
       ))
 
@@ -2903,7 +2921,7 @@ fn add_slot_to_matching_floor(
     True ->
       floor.add_parking_slot(current_floor, slot)
       |> result.map_error(fn(error) {
-        repository_error.StorageError(floor.error_message(error))
+        repository_error.InvalidPersistedData(floor.error_message(error))
       })
 
     False -> Ok(current_floor)
@@ -2914,14 +2932,25 @@ fn add_slot_to_matching_floor(
 // Error mapping
 // -----------------------------------------------------------------------------
 
-fn query(
-  result: Result(a, sqlight.Error),
+fn read_query(
+  value: Result(a, sqlight.Error),
 ) -> Result(a, repository_error.RepositoryError) {
-  case result {
-    Ok(value) -> Ok(value)
+  case value {
+    Ok(result) -> Ok(result)
 
     Error(sqlight.SqlightError(_, message, _)) ->
-      Error(repository_error.StorageError(message))
+      Error(repository_error.ReadFailed(message))
+  }
+}
+
+fn write_query(
+  value: Result(a, sqlight.Error),
+) -> Result(a, repository_error.RepositoryError) {
+  case value {
+    Ok(result) -> Ok(result)
+
+    Error(sqlight.SqlightError(_, message, _)) ->
+      Error(repository_error.WriteFailed(message))
   }
 }
 
@@ -3207,9 +3236,32 @@ pub type SqlitePaymentRepository {
   SqlitePaymentRepository(db: sqlight.Connection)
 }
 
+// -----------------------------------------------------------------------------
+// Persistence model
+// -----------------------------------------------------------------------------
+
+type PaymentRow {
+  PaymentRow(
+    id: String,
+    session_id: String,
+    amount: Int,
+    method: String,
+    status: String,
+    created_at: Int,
+  )
+}
+
+// -----------------------------------------------------------------------------
+// Constructor
+// -----------------------------------------------------------------------------
+
 pub fn new(db: sqlight.Connection) -> SqlitePaymentRepository {
   SqlitePaymentRepository(db: db)
 }
+
+// -----------------------------------------------------------------------------
+// Port adapter
+// -----------------------------------------------------------------------------
 
 pub fn to_port(
   repository: SqlitePaymentRepository,
@@ -3220,9 +3272,34 @@ pub fn to_port(
   )
 }
 
-// ----------------------------------------------------------------------------
-// Repository
-// ----------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
+// Repository operations
+// -----------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
+// Error mapping
+// -----------------------------------------------------------------------------
+
+fn read_query(
+  value: Result(a, sqlight.Error),
+) -> Result(a, repository_error.RepositoryError) {
+  case value {
+    Ok(result) -> Ok(result)
+
+    Error(sqlight.SqlightError(_, message, _)) ->
+      Error(repository_error.ReadFailed(message))
+  }
+}
+
+fn write_query(
+  value: Result(a, sqlight.Error),
+) -> Result(a, repository_error.RepositoryError) {
+  case value {
+    Ok(result) -> Ok(result)
+
+    Error(sqlight.SqlightError(_, message, _)) ->
+      Error(repository_error.WriteFailed(message))
+  }
+}
 
 pub fn get_payment(
   repository: SqlitePaymentRepository,
@@ -3230,18 +3307,18 @@ pub fn get_payment(
 ) -> Result(option.Option(payment.Payment), repository_error.RepositoryError) {
   let SqlitePaymentRepository(db: db) = repository
 
-  use payment_data <- result.try(load_payment(db, id))
+  use rows <- result.try(load_payment(db, id))
 
-  case payment_data {
+  case rows {
     [] -> Ok(option.None)
 
-    [data] -> {
-      use value <- result.try(build_payment_from_data(data))
+    [row] -> {
+      use value <- result.try(payment_row_to_domain(row))
       Ok(option.Some(value))
     }
 
     [_, _, ..] ->
-      Error(repository_error.StorageError(
+      Error(repository_error.InvalidPersistedData(
         "Multiple payments found for one payment ID",
       ))
   }
@@ -3265,29 +3342,29 @@ pub fn save_payment(
   let status = payment.get_payment_status(value)
   let created_at = payment.get_payment_created_at(value)
 
-  use method_value <- result.try(payment_method_to_string(method))
-  use status_value <- result.try(payment_status_to_string(status))
+  let method_value = payment_method_to_string(method)
+  let status_value = payment_status_to_string(status)
 
   use saved_ids <- result.try(
-    query(sqlight.query(
+    write_query(sqlight.query(
       "
-    INSERT INTO payments (
-      id,
-      session_id,
-      amount,
-      method,
-      status,
-      created_at
-    )
-    VALUES (?, ?, ?, ?, ?, ?)
-    ON CONFLICT(id) DO UPDATE SET
-      session_id = excluded.session_id,
-      amount = excluded.amount,
-      method = excluded.method,
-      status = excluded.status,
-      created_at = excluded.created_at
-    RETURNING id;
-    ",
+        INSERT INTO payments (
+          id,
+          session_id,
+          amount,
+          method,
+          status,
+          created_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+          session_id = excluded.session_id,
+          amount = excluded.amount,
+          method = excluded.method,
+          status = excluded.status,
+          created_at = excluded.created_at
+        RETURNING id;
+        ",
       on: db,
       with: [
         sqlight.text(payment_id),
@@ -3304,44 +3381,45 @@ pub fn save_payment(
   case saved_ids {
     [saved_id] if saved_id == payment_id -> Ok(Nil)
 
-    _ -> Error(repository_error.StorageError("Failed to persist payment"))
+    _ -> Error(repository_error.WriteFailed("Failed to persist payment"))
   }
 }
 
-// ----------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
 // Database queries
-// ----------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
 
 fn load_payment(
   db: sqlight.Connection,
   id: payment.PaymentId,
-) -> Result(
-  List(#(String, String, Int, String, String, Int)),
-  repository_error.RepositoryError,
-) {
-  query(sqlight.query(
+) -> Result(List(PaymentRow), repository_error.RepositoryError) {
+  read_query(sqlight.query(
     "
-    SELECT
-      id,
-      session_id,
-      amount,
-      method,
-      status,
-      created_at
-    FROM payments
-    WHERE id = ?;
-    ",
+      SELECT
+        id,
+        session_id,
+        amount,
+        method,
+        status,
+        created_at
+      FROM payments
+      WHERE id = ?;
+      ",
     on: db,
     with: [
       sqlight.text(payment.get_payment_id_value(id)),
     ],
-    expecting: payment_decoder(),
+    expecting: payment_row_decoder(),
   ))
 }
 
-fn payment_decoder() {
+// -----------------------------------------------------------------------------
+// Persistence decoder
+// -----------------------------------------------------------------------------
+
+fn payment_row_decoder() {
   decode.at([0], decode.string)
-  |> decode.then(fn(payment_id) {
+  |> decode.then(fn(id) {
     decode.at([1], decode.string)
     |> decode.then(fn(session_id) {
       decode.at([2], decode.int)
@@ -3352,7 +3430,14 @@ fn payment_decoder() {
           |> decode.then(fn(status) {
             decode.at([5], decode.int)
             |> decode.map(fn(created_at) {
-              #(payment_id, session_id, amount, method, status, created_at)
+              PaymentRow(
+                id: id,
+                session_id: session_id,
+                amount: amount,
+                method: method,
+                status: status,
+                created_at: created_at,
+              )
             })
           })
         })
@@ -3361,105 +3446,64 @@ fn payment_decoder() {
   })
 }
 
-// ----------------------------------------------------------------------------
-// Database -> Domain conversion
-// ----------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
+// Persistence -> Domain mapping
+// -----------------------------------------------------------------------------
 
-fn build_payment_from_data(
-  data: #(String, String, Int, String, String, Int),
+fn payment_row_to_domain(
+  row: PaymentRow,
 ) -> Result(payment.Payment, repository_error.RepositoryError) {
-  let #(payment_id, session_id, amount, method, status, created_at) = data
+  let PaymentRow(
+    id: payment_id,
+    session_id: session_id,
+    amount: amount,
+    method: method,
+    status: status,
+    created_at: created_at,
+  ) = row
 
-  use id <- result.try(build_payment_id(payment_id))
-  use session_id <- result.try(build_session_id(session_id))
-  use method <- result.try(payment_method_from_string(method))
+  use id <- result.try(restore_payment_id(payment_id))
+  use session_id <- result.try(restore_session_id(session_id))
+  use method <- result.try(restore_payment_method(method))
 
-  use value <- result.try(
-    case payment.new_payment(id, session_id, amount, method, created_at) {
-      Ok(value) -> Ok(value)
+  use value <- result.try(restore_payment(
+    id,
+    session_id,
+    amount,
+    method,
+    created_at,
+  ))
 
-      Error(error) ->
-        Error(repository_error.StorageError(payment.error_message(error)))
-    },
-  )
-
-  apply_payment_status(value, status)
+  restore_payment_status(value, status)
 }
 
-fn build_payment_id(
+fn restore_payment_id(
   value: String,
 ) -> Result(payment.PaymentId, repository_error.RepositoryError) {
   case payment.new_payment_id(value) {
     Ok(id) -> Ok(id)
 
     Error(error) ->
-      Error(repository_error.StorageError(payment.error_message(error)))
+      Error(repository_error.InvalidPersistedData(payment.error_message(error)))
   }
 }
 
-fn build_session_id(
+fn restore_session_id(
   value: String,
 ) -> Result(parking_session.ParkingSessionId, repository_error.RepositoryError) {
   case parking_session.new_parking_session_id(value) {
     Ok(id) -> Ok(id)
 
     Error(error) ->
-      Error(repository_error.StorageError(parking_session.error_message(error)))
+      Error(
+        repository_error.InvalidPersistedData(parking_session.error_message(
+          error,
+        )),
+      )
   }
 }
 
-fn apply_payment_status(
-  value: payment.Payment,
-  status: String,
-) -> Result(payment.Payment, repository_error.RepositoryError) {
-  case status {
-    "Pending" -> Ok(value)
-
-    "Succeeded" ->
-      case payment.succeed_payment(value) {
-        Ok(updated) -> Ok(updated)
-
-        Error(error) ->
-          Error(repository_error.StorageError(payment.error_message(error)))
-      }
-
-    "Failed" ->
-      case payment.fail_payment(value) {
-        Ok(updated) -> Ok(updated)
-
-        Error(error) ->
-          Error(repository_error.StorageError(payment.error_message(error)))
-      }
-
-    "Cancelled" ->
-      case payment.cancel_payment(value) {
-        Ok(updated) -> Ok(updated)
-
-        Error(error) ->
-          Error(repository_error.StorageError(payment.error_message(error)))
-      }
-
-    _ ->
-      Error(repository_error.StorageError("Invalid payment status in database"))
-  }
-}
-
-// ----------------------------------------------------------------------------
-// Enum conversion
-// ----------------------------------------------------------------------------
-
-fn payment_method_to_string(
-  method: payment.PaymentMethod,
-) -> Result(String, repository_error.RepositoryError) {
-  case method {
-    payment.Cash -> Ok("Cash")
-    payment.Qris -> Ok("Qris")
-    payment.DebitCard -> Ok("DebitCard")
-    payment.EWallet -> Ok("EWallet")
-  }
-}
-
-fn payment_method_from_string(
+fn restore_payment_method(
   value: String,
 ) -> Result(payment.PaymentMethod, repository_error.RepositoryError) {
   case value {
@@ -3469,33 +3513,83 @@ fn payment_method_from_string(
     "EWallet" -> Ok(payment.EWallet)
 
     _ ->
-      Error(repository_error.StorageError("Invalid payment method in database"))
+      Error(repository_error.InvalidPersistedData(
+        "Invalid payment method in database",
+      ))
   }
 }
 
-fn payment_status_to_string(
-  status: payment.PaymentStatus,
-) -> Result(String, repository_error.RepositoryError) {
+fn restore_payment(
+  id: payment.PaymentId,
+  session_id: parking_session.ParkingSessionId,
+  amount: Int,
+  method: payment.PaymentMethod,
+  created_at: Int,
+) -> Result(payment.Payment, repository_error.RepositoryError) {
+  case payment.new_payment(id, session_id, amount, method, created_at) {
+    Ok(value) -> Ok(value)
+
+    Error(error) ->
+      Error(repository_error.InvalidPersistedData(payment.error_message(error)))
+  }
+}
+
+// -----------------------------------------------------------------------------
+// Domain state restoration
+// -----------------------------------------------------------------------------
+
+fn restore_payment_status(
+  value: payment.Payment,
+  status: String,
+) -> Result(payment.Payment, repository_error.RepositoryError) {
   case status {
-    payment.Pending -> Ok("Pending")
-    payment.Succeeded -> Ok("Succeeded")
-    payment.Failed -> Ok("Failed")
-    payment.Cancelled -> Ok("Cancelled")
+    "Pending" -> Ok(value)
+
+    "Succeeded" -> restore_state_transition(value, payment.succeed_payment)
+
+    "Failed" -> restore_state_transition(value, payment.fail_payment)
+
+    "Cancelled" -> restore_state_transition(value, payment.cancel_payment)
+
+    _ ->
+      Error(repository_error.InvalidPersistedData(
+        "Invalid payment status in database",
+      ))
   }
 }
 
-// ----------------------------------------------------------------------------
-// Error mapping
-// ----------------------------------------------------------------------------
+fn restore_state_transition(
+  value: payment.Payment,
+  transition: fn(payment.Payment) ->
+    Result(payment.Payment, payment.PaymentError),
+) -> Result(payment.Payment, repository_error.RepositoryError) {
+  case transition(value) {
+    Ok(updated) -> Ok(updated)
 
-fn query(
-  value: Result(a, sqlight.Error),
-) -> Result(a, repository_error.RepositoryError) {
-  case value {
-    Ok(result) -> Ok(result)
+    Error(error) ->
+      Error(repository_error.InvalidPersistedData(payment.error_message(error)))
+  }
+}
 
-    Error(sqlight.SqlightError(_, message, _)) ->
-      Error(repository_error.StorageError(message))
+// -----------------------------------------------------------------------------
+// Domain -> Persistence conversion
+// -----------------------------------------------------------------------------
+
+fn payment_method_to_string(method: payment.PaymentMethod) -> String {
+  case method {
+    payment.Cash -> "Cash"
+    payment.Qris -> "Qris"
+    payment.DebitCard -> "DebitCard"
+    payment.EWallet -> "EWallet"
+  }
+}
+
+fn payment_status_to_string(status: payment.PaymentStatus) -> String {
+  case status {
+    payment.Pending -> "Pending"
+    payment.Succeeded -> "Succeeded"
+    payment.Failed -> "Failed"
+    payment.Cancelled -> "Cancelled"
   }
 }
 
@@ -3518,9 +3612,32 @@ pub type SqliteSessionRepository {
   SqliteSessionRepository(db: sqlight.Connection)
 }
 
+// -----------------------------------------------------------------------------
+// Persistence model
+// -----------------------------------------------------------------------------
+
+type SessionRow {
+  SessionRow(
+    id: String,
+    vehicle_id: String,
+    slot_id: String,
+    entry_time: Int,
+    state: String,
+    exit_time: Int,
+  )
+}
+
+// -----------------------------------------------------------------------------
+// Constructor
+// -----------------------------------------------------------------------------
+
 pub fn new(db: sqlight.Connection) -> SqliteSessionRepository {
   SqliteSessionRepository(db: db)
 }
+
+// -----------------------------------------------------------------------------
+// Port adapter
+// -----------------------------------------------------------------------------
 
 pub fn to_port(
   repository: SqliteSessionRepository,
@@ -3532,7 +3649,7 @@ pub fn to_port(
 }
 
 // -----------------------------------------------------------------------------
-// Repository
+// Repository operations
 // -----------------------------------------------------------------------------
 
 pub fn get_active_sessions(
@@ -3543,9 +3660,8 @@ pub fn get_active_sessions(
 ) {
   let SqliteSessionRepository(db: db) = repository
 
-  use session_data <- result.try(load_active_sessions(db))
-
-  build_sessions(session_data)
+  use rows <- result.try(load_active_sessions(db))
+  build_sessions(rows)
 }
 
 pub fn get_session(
@@ -3557,18 +3673,18 @@ pub fn get_session(
 ) {
   let SqliteSessionRepository(db: db) = repository
 
-  use session_data <- result.try(load_session(db, id))
+  use rows <- result.try(load_session(db, id))
 
-  case session_data {
+  case rows {
     [] -> Ok(option.None)
 
-    [data] -> {
-      use session <- result.try(build_session_from_data(data))
+    [row] -> {
+      use session <- result.try(session_row_to_domain(row))
       Ok(option.Some(session))
     }
 
     [_, _, ..] ->
-      Error(repository_error.StorageError(
+      Error(repository_error.InvalidPersistedData(
         "Multiple parking sessions found for one session ID",
       ))
   }
@@ -3577,76 +3693,74 @@ pub fn get_session(
 // -----------------------------------------------------------------------------
 // Database queries
 // -----------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
+// Error mapping
+// -----------------------------------------------------------------------------
+
+fn read_query(
+  value: Result(a, sqlight.Error),
+) -> Result(a, repository_error.RepositoryError) {
+  case value {
+    Ok(result) -> Ok(result)
+
+    Error(sqlight.SqlightError(_, message, _)) ->
+      Error(repository_error.ReadFailed(message))
+  }
+}
 
 fn load_active_sessions(
   db: sqlight.Connection,
-) -> Result(
-  List(#(String, String, String, Int)),
-  repository_error.RepositoryError,
-) {
-  query(sqlight.query(
+) -> Result(List(SessionRow), repository_error.RepositoryError) {
+  read_query(sqlight.query(
     "
-    SELECT
-      id,
-      vehicle_id,
-      slot_id,
-      entry_time
-    FROM parking_sessions
-    WHERE state = 'Active'
-    ORDER BY entry_time, id;
-    ",
+      SELECT
+        id,
+        vehicle_id,
+        slot_id,
+        entry_time,
+        state,
+        COALESCE(exit_time, -1)
+      FROM parking_sessions
+      WHERE state = 'Active'
+      ORDER BY entry_time, id;
+      ",
     on: db,
     with: [],
-    expecting: active_session_decoder(),
+    expecting: session_row_decoder(),
   ))
 }
 
 fn load_session(
   db: sqlight.Connection,
   id: parking_session.ParkingSessionId,
-) -> Result(
-  List(#(String, String, String, Int, String, Int)),
-  repository_error.RepositoryError,
-) {
-  query(sqlight.query(
+) -> Result(List(SessionRow), repository_error.RepositoryError) {
+  read_query(sqlight.query(
     "
-    SELECT
-      id,
-      vehicle_id,
-      slot_id,
-      entry_time,
-      state,
-      COALESCE(exit_time, -1)
-    FROM parking_sessions
-    WHERE id = ?;
-    ",
+      SELECT
+        id,
+        vehicle_id,
+        slot_id,
+        entry_time,
+        state,
+        COALESCE(exit_time, -1)
+      FROM parking_sessions
+      WHERE id = ?;
+      ",
     on: db,
     with: [
       sqlight.text(parking_session.get_parking_session_id_value(id)),
     ],
-    expecting: session_decoder(),
+    expecting: session_row_decoder(),
   ))
 }
 
-fn active_session_decoder() {
-  decode.at([0], decode.string)
-  |> decode.then(fn(session_id) {
-    decode.at([1], decode.string)
-    |> decode.then(fn(vehicle_id) {
-      decode.at([2], decode.string)
-      |> decode.then(fn(slot_id) {
-        decode.at([3], decode.int)
-        |> decode.map(fn(entry_time) {
-          #(session_id, vehicle_id, slot_id, entry_time)
-        })
-      })
-    })
-  })
-}
+// -----------------------------------------------------------------------------
+// Persistence decoder
+// -----------------------------------------------------------------------------
 
-fn session_decoder() {
+fn session_row_decoder() {
   decode.at([0], decode.string)
-  |> decode.then(fn(session_id) {
+  |> decode.then(fn(id) {
     decode.at([1], decode.string)
     |> decode.then(fn(vehicle_id) {
       decode.at([2], decode.string)
@@ -3657,7 +3771,14 @@ fn session_decoder() {
           |> decode.then(fn(state) {
             decode.at([5], decode.int)
             |> decode.map(fn(exit_time) {
-              #(session_id, vehicle_id, slot_id, entry_time, state, exit_time)
+              SessionRow(
+                id: id,
+                vehicle_id: vehicle_id,
+                slot_id: slot_id,
+                entry_time: entry_time,
+                state: state,
+                exit_time: exit_time,
+              )
             })
           })
         })
@@ -3667,43 +3788,119 @@ fn session_decoder() {
 }
 
 // -----------------------------------------------------------------------------
-// Database -> Domain conversion
+// Persistence -> Domain mapping
 // -----------------------------------------------------------------------------
 
 fn build_sessions(
-  session_data: List(#(String, String, String, Int)),
+  rows: List(SessionRow),
 ) -> Result(
   List(parking_session.ParkingSession),
   repository_error.RepositoryError,
 ) {
-  list.fold(session_data, Ok([]), fn(acc, data) {
+  list.fold(rows, Ok([]), fn(acc, row) {
     use sessions <- result.try(acc)
-    use session <- result.try(build_active_session_from_data(data))
+    use session <- result.try(session_row_to_domain(row))
 
     Ok(list.append(sessions, [session]))
   })
 }
 
-fn build_active_session_from_data(
-  data: #(String, String, String, Int),
+fn session_row_to_domain(
+  row: SessionRow,
 ) -> Result(parking_session.ParkingSession, repository_error.RepositoryError) {
-  let #(session_id, vehicle_id, slot_id, entry_time) = data
+  let SessionRow(
+    id: session_id,
+    vehicle_id: vehicle_id,
+    slot_id: slot_id,
+    entry_time: entry_time,
+    state: state,
+    exit_time: exit_time,
+  ) = row
 
-  build_session(session_id, vehicle_id, slot_id, entry_time)
+  use id <- result.try(restore_session_id(session_id))
+  use vehicle_id <- result.try(restore_vehicle_id(vehicle_id))
+  use slot_id <- result.try(restore_slot_id(slot_id))
+  use session <- result.try(restore_session(id, vehicle_id, slot_id, entry_time))
+
+  restore_session_state(session, state, exit_time)
 }
 
-fn build_session_from_data(
-  data: #(String, String, String, Int, String, Int),
+// -----------------------------------------------------------------------------
+// Domain value restoration
+// -----------------------------------------------------------------------------
+
+fn restore_session_id(
+  value: String,
+) -> Result(parking_session.ParkingSessionId, repository_error.RepositoryError) {
+  case parking_session.new_parking_session_id(value) {
+    Ok(id) -> Ok(id)
+
+    Error(error) ->
+      Error(
+        repository_error.InvalidPersistedData(parking_session.error_message(
+          error,
+        )),
+      )
+  }
+}
+
+fn restore_vehicle_id(
+  value: String,
+) -> Result(vehicle.VehicleId, repository_error.RepositoryError) {
+  case vehicle.new_vehicle_id(value) {
+    Ok(id) -> Ok(id)
+
+    Error(error) ->
+      Error(repository_error.InvalidPersistedData(vehicle.error_message(error)))
+  }
+}
+
+fn restore_slot_id(
+  value: String,
+) -> Result(parking_slot.ParkingSlotId, repository_error.RepositoryError) {
+  case parking_slot.new_parking_slot_id(value) {
+    Ok(id) -> Ok(id)
+
+    Error(error) ->
+      Error(
+        repository_error.InvalidPersistedData(parking_slot.error_message(error)),
+      )
+  }
+}
+
+// -----------------------------------------------------------------------------
+// Domain entity restoration
+// -----------------------------------------------------------------------------
+
+fn restore_session(
+  id: parking_session.ParkingSessionId,
+  vehicle_id: vehicle.VehicleId,
+  slot_id: parking_slot.ParkingSlotId,
+  entry_time: Int,
 ) -> Result(parking_session.ParkingSession, repository_error.RepositoryError) {
-  let #(session_id, vehicle_id, slot_id, entry_time, state, exit_time) = data
+  case
+    parking_session.new_parking_session(id, vehicle_id, slot_id, entry_time)
+  {
+    Ok(session) -> Ok(session)
 
-  use session <- result.try(build_session(
-    session_id,
-    vehicle_id,
-    slot_id,
-    entry_time,
-  ))
+    Error(error) ->
+      Error(
+        repository_error.InvalidPersistedData(parking_session.error_message(
+          error,
+        )),
+      )
+  }
+}
 
+// -----------------------------------------------------------------------------
+// Domain state restoration
+// -----------------------------------------------------------------------------
+
+fn restore_session_state(
+  session: parking_session.ParkingSession,
+  state: String,
+  exit_time: Int,
+) -> Result(parking_session.ParkingSession, repository_error.RepositoryError) {
   case state {
     "Active" if exit_time == -1 -> Ok(session)
 
@@ -3713,63 +3910,16 @@ fn build_session_from_data(
 
         Error(error) ->
           Error(
-            repository_error.StorageError(parking_session.error_message(error)),
+            repository_error.InvalidPersistedData(parking_session.error_message(
+              error,
+            )),
           )
       }
 
     _ ->
-      Error(repository_error.StorageError(
+      Error(repository_error.InvalidPersistedData(
         "Invalid parking session state or exit time in database",
       ))
-  }
-}
-
-fn build_session(
-  session_id: String,
-  vehicle_id: String,
-  slot_id: String,
-  entry_time: Int,
-) -> Result(parking_session.ParkingSession, repository_error.RepositoryError) {
-  use id <- result.try(case parking_session.new_parking_session_id(session_id) {
-    Ok(value) -> Ok(value)
-    Error(error) ->
-      Error(repository_error.StorageError(parking_session.error_message(error)))
-  })
-
-  use vehicle_id <- result.try(case vehicle.new_vehicle_id(vehicle_id) {
-    Ok(value) -> Ok(value)
-    Error(error) ->
-      Error(repository_error.StorageError(vehicle.error_message(error)))
-  })
-
-  use slot_id <- result.try(case parking_slot.new_parking_slot_id(slot_id) {
-    Ok(value) -> Ok(value)
-    Error(error) ->
-      Error(repository_error.StorageError(parking_slot.error_message(error)))
-  })
-
-  case
-    parking_session.new_parking_session(id, vehicle_id, slot_id, entry_time)
-  {
-    Ok(session) -> Ok(session)
-
-    Error(error) ->
-      Error(repository_error.StorageError(parking_session.error_message(error)))
-  }
-}
-
-// -----------------------------------------------------------------------------
-// Error mapping
-// -----------------------------------------------------------------------------
-
-fn query(
-  result: Result(a, sqlight.Error),
-) -> Result(a, repository_error.RepositoryError) {
-  case result {
-    Ok(value) -> Ok(value)
-
-    Error(sqlight.SqlightError(_, message, _)) ->
-      Error(repository_error.StorageError(message))
   }
 }
 
@@ -3802,8 +3952,11 @@ pub fn main() -> Nil {
       }
     }
 
-    Error(repository_error.StorageError(message)) ->
-      io.println("Database initialization failed: " <> message)
+    Error(repository_error) ->
+      io.println(
+        "Database initialization failed: "
+        <> repository_error.error_message(repository_error),
+      )
   }
 }
 
@@ -3820,8 +3973,8 @@ fn seed_error_message(
     seed_parking_layout.FloorConfigurationFailed(domain_error) ->
       "Floor configuration failed: " <> floor.error_message(domain_error)
 
-    seed_parking_layout.RepositoryFailed(repository_error.StorageError(message)) ->
-      "Repository failed: " <> message
+    seed_parking_layout.RepositoryFailed(repository_error) ->
+      "Repository failed: " <> repository_error.error_message(repository_error)
   }
 }
 
@@ -3921,7 +4074,7 @@ fn make_service(
 }
 
 fn make_storage_error() -> repository_error.RepositoryError {
-  repository_error.StorageError("database unavailable")
+  repository_error.WriteFailed("database unavailable")
 }
 
 fn make_failing_service(
@@ -6022,7 +6175,7 @@ pub fn vehicle_identity_conflict_rejects_entry_test() {
   let result = sqlite_entry_parking_transaction.enter(transaction, request)
 
   case result {
-    Error(entry_parking_transaction.RepositoryFailed(repository_error.StorageError(
+    Error(entry_parking_transaction.RepositoryFailed(repository_error.InvalidPersistedData(
       _,
     ))) -> Nil
 
@@ -6097,7 +6250,7 @@ pub fn failed_session_insert_rolls_back_vehicle_test() {
   let result = sqlite_entry_parking_transaction.enter(transaction, request)
 
   case result {
-    Error(entry_parking_transaction.RepositoryFailed(repository_error.StorageError(
+    Error(entry_parking_transaction.RepositoryFailed(repository_error.WriteFailed(
       _,
     ))) -> Nil
 
@@ -6141,7 +6294,7 @@ pub fn failed_ticket_insert_rolls_back_vehicle_and_session_test() {
   let result = sqlite_entry_parking_transaction.enter(transaction, request)
 
   case result {
-    Error(entry_parking_transaction.RepositoryFailed(repository_error.StorageError(
+    Error(entry_parking_transaction.RepositoryFailed(repository_error.WriteFailed(
       _,
     ))) -> Nil
 
@@ -6441,10 +6594,10 @@ pub fn closed_session_cannot_exit_again_test() {
     execute(
       db,
       "
-    UPDATE parking_sessions
-    SET exit_time = 2000, state = 'Closed'
-    WHERE id = 'SESSION-001';
-    ",
+      UPDATE parking_sessions
+      SET exit_time = 2000, state = 'Closed'
+      WHERE id = 'SESSION-001';
+      ",
     )
 
   let transaction = sqlite_exit_parking_transaction.new(db)
@@ -6481,12 +6634,12 @@ pub fn failed_session_update_rolls_back_payment_test() {
     execute(
       db,
       "
-    CREATE TRIGGER reject_session_exit
-    BEFORE UPDATE ON parking_sessions
-    BEGIN
-      SELECT RAISE(ABORT, 'Simulated session update failure');
-    END;
-    ",
+      CREATE TRIGGER reject_session_exit
+      BEFORE UPDATE ON parking_sessions
+      BEGIN
+        SELECT RAISE(ABORT, 'Simulated session update failure');
+      END;
+      ",
     )
 
   let transaction = sqlite_exit_parking_transaction.new(db)
@@ -6495,7 +6648,7 @@ pub fn failed_session_update_rolls_back_payment_test() {
   let result = sqlite_exit_parking_transaction.exit(transaction, request)
 
   case result {
-    Error(exit_parking_transaction.RepositoryFailed(repository_error.StorageError(
+    Error(exit_parking_transaction.RepositoryFailed(repository_error.WriteFailed(
       _,
     ))) -> Nil
 

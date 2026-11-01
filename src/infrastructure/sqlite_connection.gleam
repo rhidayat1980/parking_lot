@@ -18,11 +18,11 @@ pub fn connect_to(
         Ok(Nil) -> Ok(connection)
 
         Error(error) -> {
-          let storage_error = to_repository_error(error)
+          let repository_error = to_repository_error(error)
 
           case sqlight.close(connection) {
-            Ok(Nil) -> Error(storage_error)
-            Error(_) -> Error(storage_error)
+            Ok(Nil) -> Error(repository_error)
+            Error(_) -> Error(repository_error)
           }
         }
       }
@@ -37,7 +37,6 @@ fn to_repository_error(
   error: sqlight.Error,
 ) -> repository_error.RepositoryError {
   case error {
-    sqlight.SqlightError(_, message, _) ->
-      repository_error.StorageError(message)
+    sqlight.SqlightError(_, message, _) -> repository_error.ReadFailed(message)
   }
 }

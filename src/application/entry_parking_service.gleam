@@ -15,8 +15,9 @@ pub type EntryParkingServiceError {
 
 pub fn error_message(error: EntryParkingServiceError) -> String {
   case error {
-    TransactionFailed(repository_error.StorageError(message)) ->
-      "Failed to complete parking entry: " <> message
+    TransactionFailed(repository_error) ->
+      "Failed to complete parking entry: "
+      <> repository_error.error_message(repository_error)
 
     EntryFailed(entry_error) -> entry_parking.error_message(entry_error)
 
@@ -51,9 +52,7 @@ fn transaction_error_message(
 }
 
 fn repository_error_message(error: repository_error.RepositoryError) -> String {
-  case error {
-    repository_error.StorageError(message) -> message
-  }
+  repository_error.error_message(error)
 }
 
 // MARK: Service Dependencies
