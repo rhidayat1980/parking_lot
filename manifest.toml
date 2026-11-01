@@ -7,13 +7,23 @@
 # You should check this file into your source control repository.
 
 packages = [
+  { name = "cake", version = "4.1.0", build_tools = ["gleam"], requirements = ["gleam_stdlib", "gleam_time"], otp_app = "cake", source = "hex", outer_checksum = "EC046BE4465DECFF44312D185DE2EF00C053EDEFB964351C79745A2339CF08C1" },
+  { name = "cake_sqlight", version = "1.5.0", build_tools = ["gleam"], requirements = ["cake", "gleam_stdlib", "gleam_time", "sqlight"], otp_app = "cake_sqlight", source = "hex", outer_checksum = "F4BCD48125C95E9434A6B1C925A3C3E64A13786601003730405E230C9075BDB7" },
   { name = "esqlite", version = "0.10.0", build_tools = ["rebar3"], requirements = [], otp_app = "esqlite", source = "hex", outer_checksum = "ED19577AC6A75A7E431F84907E14A1F045850CE11D17D0386D46436773E61516" },
+  { name = "filepath", version = "1.1.2", build_tools = ["gleam"], requirements = ["gleam_stdlib"], otp_app = "filepath", source = "hex", outer_checksum = "B06A9AF0BF10E51401D64B98E4B627F1D2E48C154967DA7AF4D0914780A6D40A" },
   { name = "gleam_stdlib", version = "1.0.5", build_tools = ["gleam"], requirements = [], otp_app = "gleam_stdlib", source = "hex", outer_checksum = "CEE5B6C076A85B45F60C585F4316C63EC8B7127C119D5738C3958A9C4D50404E" },
+  { name = "gleam_time", version = "1.11.0", build_tools = ["gleam"], requirements = ["gleam_stdlib"], otp_app = "gleam_time", source = "hex", outer_checksum = "3AB789C3ED4EB9DDA7283F46C3CF83A5487C9CFB790DC3FF8F8ACB5BF7B7A6C1" },
   { name = "gleeunit", version = "1.11.0", build_tools = ["gleam"], requirements = ["gleam_stdlib"], otp_app = "gleeunit", source = "hex", outer_checksum = "EC31ABA74256AEA531EDF8169931D775BBB384FED0A8A1BDC4DD9354E3E21826" },
+  { name = "migrant", version = "1.1.0", build_tools = ["gleam"], requirements = ["gleam_stdlib", "simplifile", "sqlight"], otp_app = "migrant", source = "hex", outer_checksum = "D2FC13DA35C61E2FCE51A3B4B61FF77ED7CD3B81807A72D48CD59EFB63F26A9F" },
+  { name = "simplifile", version = "2.7.0", build_tools = ["gleam"], requirements = ["filepath", "gleam_stdlib"], otp_app = "simplifile", source = "hex", outer_checksum = "A2727627B063E87351934C7F7F008F2D1FDB16F6DE0B8C79F9E46459CFC9C164" },
   { name = "sqlight", version = "1.2.0", build_tools = ["gleam"], requirements = ["esqlite", "gleam_stdlib"], otp_app = "sqlight", source = "hex", outer_checksum = "841768D0A81107EE2DB46B949354F284A68B2E8098315C28A1FE3C07D206C17A" },
 ]
 
 [requirements]
+cake = { version = ">= 4.1.0 and < 5.0.0" }
+cake_sqlight = { version = ">= 1.5.0 and < 2.0.0" }
 gleam_stdlib = { version = ">= 1.0.0 and < 2.0.0" }
 gleeunit = { version = ">= 1.0.0 and < 2.0.0" }
+migrant = { version = ">= 1.1.0 and < 2.0.0" }
+simplifile = { version = ">= 2.7.0 and < 3.0.0" }
 sqlight = { version = ">= 1.2.0 and < 2.0.0" }
