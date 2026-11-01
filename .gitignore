@@ -3,10 +3,7 @@
 /build
 erl_crash.dump
 
-# Local SQLite database
 priv/repo/*.db
 priv/repo/*.db-shm
 priv/repo/*.db-wal
-
-# Local database backups
 priv/repo/backups/
