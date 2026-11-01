@@ -1,15 +1,23 @@
+import application/entry_parking_service
 import application/ports/repository_error
 import application/seed_parking_layout
 import domain/floor
 import domain/parking_slot
 import gleam/io
 import infrastructure/sqlite_database
+import infrastructure/sqlite_entry_parking_transaction
 import infrastructure/sqlite_floor_repository
 import interface/cli/app
 
 pub fn main() -> Nil {
   case sqlite_database.connect() {
     Ok(db) -> {
+      let entry_transaction =
+        sqlite_entry_parking_transaction.new(db)
+        |> sqlite_entry_parking_transaction.to_port
+
+      let entry_service = entry_parking_service.new(entry_transaction)
+
       let floor_repository =
         sqlite_floor_repository.new(db)
         |> sqlite_floor_repository.to_port
@@ -17,7 +25,7 @@ pub fn main() -> Nil {
       case seed_parking_layout.seed(floor_repository) {
         Ok(Nil) -> {
           io.println("Parking layout seeded successfully")
-          app.run()
+          app.run(entry_service)
         }
 
         Error(error) ->

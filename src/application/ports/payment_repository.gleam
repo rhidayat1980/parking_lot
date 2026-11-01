@@ -12,3 +12,4 @@ pub type PaymentRepository {
       Result(Nil, repository_error.RepositoryError),
   )
 }
+// mapping error 

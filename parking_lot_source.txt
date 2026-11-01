@@ -1,8 +1,11 @@
+PARKING LOT — GLEAM SOURCE CODE
+================================================================================
+Total files: 59
 
-
-============================================================
+================================================================================
 FILE: src/application/entry_parking.gleam
-============================================================
+================================================================================
+
 import domain/floor
 import domain/parking_allocation
 import domain/parking_session
@@ -219,9 +222,10 @@ fn try_allocate_slot(
 }
 
 
-============================================================
+================================================================================
 FILE: src/application/entry_parking_service.gleam
-============================================================
+================================================================================
+
 import application/entry_parking
 import application/ports/entry_parking_transaction
 import application/ports/repository_error
@@ -325,9 +329,10 @@ pub fn enter(
 }
 
 
-============================================================
+================================================================================
 FILE: src/application/exit_parking.gleam
-============================================================
+================================================================================
+
 import domain/parking_fee
 import domain/parking_session
 import domain/payment
@@ -471,9 +476,10 @@ fn require_payment_id(
 }
 
 
-============================================================
+================================================================================
 FILE: src/application/exit_parking_service.gleam
-============================================================
+================================================================================
+
 import application/exit_parking
 import application/ports/exit_parking_transaction
 import application/ports/repository_error
@@ -566,9 +572,10 @@ pub fn exit(
 }
 
 
-============================================================
+================================================================================
 FILE: src/application/ports/entry_parking_transaction.gleam
-============================================================
+================================================================================
+
 import application/entry_parking
 import application/ports/repository_error
 
@@ -593,9 +600,10 @@ pub type EntryParkingTransactionError {
 }
 
 
-============================================================
+================================================================================
 FILE: src/application/ports/exit_parking_transaction.gleam
-============================================================
+================================================================================
+
 import application/exit_parking
 import application/ports/repository_error
 
@@ -620,9 +628,10 @@ pub type ExitParkingTransactionError {
 }
 
 
-============================================================
+================================================================================
 FILE: src/application/ports/parking_floor_repository.gleam
-============================================================
+================================================================================
+
 import application/ports/repository_error
 import domain/floor
 
@@ -638,9 +647,10 @@ pub type ParkingFloorRepository {
 }
 
 
-============================================================
+================================================================================
 FILE: src/application/ports/parking_session_repository.gleam
-============================================================
+================================================================================
+
 import application/ports/repository_error
 import domain/parking_session
 import gleam/option
@@ -663,9 +673,10 @@ pub type ParkingSessionRepository {
 }
 
 
-============================================================
+================================================================================
 FILE: src/application/ports/parking_ticket_repository.gleam
-============================================================
+================================================================================
+
 import application/ports/repository_error
 import domain/parking_ticket
 import gleam/option.{type Option}
@@ -683,9 +694,10 @@ pub type ParkingTicketRepository {
 }
 
 
-============================================================
+================================================================================
 FILE: src/application/ports/payment_repository.gleam
-============================================================
+================================================================================
+
 import application/ports/repository_error
 import domain/payment
 import gleam/option.{type Option}
@@ -700,11 +712,13 @@ pub type PaymentRepository {
       Result(Nil, repository_error.RepositoryError),
   )
 }
+// mapping error 
 
 
-============================================================
+================================================================================
 FILE: src/application/ports/repository_error.gleam
-============================================================
+================================================================================
+
 pub type RepositoryError {
   ReadFailed(String)
   WriteFailed(String)
@@ -720,9 +734,10 @@ pub fn error_message(error: RepositoryError) -> String {
 }
 
 
-============================================================
+================================================================================
 FILE: src/application/seed_parking_layout.gleam
-============================================================
+================================================================================
+
 import application/ports/parking_floor_repository
 import application/ports/repository_error
 import domain/floor
@@ -802,9 +817,54 @@ fn build_floor(
 }
 
 
-============================================================
+================================================================================
+FILE: src/application/view_parking_status.gleam
+================================================================================
+
+import application/ports/parking_floor_repository
+import application/ports/parking_session_repository
+import application/ports/repository_error
+import domain/floor
+import domain/parking_session
+import gleam/result
+
+/// Data required to display the current parking lot status.
+pub type ParkingStatus {
+  ParkingStatus(
+    floors: List(floor.ParkingFloor),
+    active_sessions: List(parking_session.ParkingSession),
+  )
+}
+
+/// Errors that can occur while retrieving the parking status.
+pub type ViewParkingStatusError {
+  FloorRepositoryFailed(repository_error.RepositoryError)
+  SessionRepositoryFailed(repository_error.RepositoryError)
+}
+
+/// Retrieves all parking floors and currently active parking sessions.
+pub fn view(
+  floor_repository: parking_floor_repository.ParkingFloorRepository,
+  session_repository: parking_session_repository.ParkingSessionRepository,
+) -> Result(ParkingStatus, ViewParkingStatusError) {
+  use floors <- result.try(
+    floor_repository.get_all_floors()
+    |> result.map_error(FloorRepositoryFailed),
+  )
+
+  use active_sessions <- result.try(
+    session_repository.get_active_sessions()
+    |> result.map_error(SessionRepositoryFailed),
+  )
+
+  Ok(ParkingStatus(floors: floors, active_sessions: active_sessions))
+}
+
+
+================================================================================
 FILE: src/domain/floor.gleam
-============================================================
+================================================================================
+
 import domain/parking_slot
 import gleam/list
 import gleam/string
@@ -896,9 +956,10 @@ pub fn add_parking_slot(
 }
 
 
-============================================================
+================================================================================
 FILE: src/domain/parking_allocation.gleam
-============================================================
+================================================================================
+
 import domain/parking_session
 import domain/parking_slot
 import domain/vehicle
@@ -1059,9 +1120,10 @@ fn construct_parking_session(
 }
 
 
-============================================================
+================================================================================
 FILE: src/domain/parking_fee.gleam
-============================================================
+================================================================================
+
 import gleam/int
 
 // MARK: Errors
@@ -1118,9 +1180,10 @@ pub fn calculate_parking_fee(
 }
 
 
-============================================================
+================================================================================
 FILE: src/domain/parking_pricing_policy.gleam
-============================================================
+================================================================================
+
 import domain/vehicle
 import gleam/result
 
@@ -1225,9 +1288,10 @@ pub fn get_hourly_rate(
 }
 
 
-============================================================
+================================================================================
 FILE: src/domain/parking_session.gleam
-============================================================
+================================================================================
+
 import domain/parking_slot
 import domain/vehicle
 import gleam/option
@@ -1400,9 +1464,10 @@ pub fn close_parking_session(
 }
 
 
-============================================================
+================================================================================
 FILE: src/domain/parking_slot.gleam
-============================================================
+================================================================================
+
 import domain/vehicle
 import gleam/string
 
@@ -1470,9 +1535,10 @@ pub fn supports_vehicle(slot: ParkingSlot, vehicle: vehicle.Vehicle) -> Bool {
 }
 
 
-============================================================
+================================================================================
 FILE: src/domain/parking_ticket.gleam
-============================================================
+================================================================================
+
 import domain/parking_session
 import gleam/string
 
@@ -1550,9 +1616,10 @@ pub fn get_parking_ticket_issued_at(ticket: ParkingTicket) -> Int {
 }
 
 
-============================================================
+================================================================================
 FILE: src/domain/payment.gleam
-============================================================
+================================================================================
+
 import domain/parking_session
 import gleam/string
 
@@ -1707,9 +1774,10 @@ fn transition_to(
 }
 
 
-============================================================
+================================================================================
 FILE: src/domain/vehicle.gleam
-============================================================
+================================================================================
+
 import gleam/string
 
 // MARK: Errors
@@ -1808,9 +1876,10 @@ pub fn get_vehicle_type(vehicle: Vehicle) -> VehicleType {
 }
 
 
-============================================================
+================================================================================
 FILE: src/infrastructure/sqlite_connection.gleam
-============================================================
+================================================================================
+
 import application/ports/repository_error
 import sqlight
 
@@ -1855,9 +1924,10 @@ fn to_repository_error(
 }
 
 
-============================================================
+================================================================================
 FILE: src/infrastructure/sqlite_database.gleam
-============================================================
+================================================================================
+
 import application/ports/repository_error
 import gleam/result
 import infrastructure/sqlite_connection
@@ -1885,9 +1955,10 @@ pub fn connect() -> Result(sqlight.Connection, repository_error.RepositoryError)
 }
 
 
-============================================================
+================================================================================
 FILE: src/infrastructure/sqlite_entry_parking_transaction.gleam
-============================================================
+================================================================================
+
 import application/entry_parking
 import application/ports/entry_parking_transaction
 import application/ports/repository_error
@@ -2257,9 +2328,10 @@ fn persist_ticket(
 }
 
 
-============================================================
+================================================================================
 FILE: src/infrastructure/sqlite_exit_parking_transaction.gleam
-============================================================
+================================================================================
+
 import application/exit_parking
 import application/ports/exit_parking_transaction
 import application/ports/payment_repository
@@ -2527,9 +2599,10 @@ fn query_result(
 }
 
 
-============================================================
+================================================================================
 FILE: src/infrastructure/sqlite_floor_repository.gleam
-============================================================
+================================================================================
+
 import application/ports/parking_floor_repository
 import application/ports/repository_error
 import domain/floor
@@ -2955,9 +3028,10 @@ fn write_query(
 }
 
 
-============================================================
+================================================================================
 FILE: src/infrastructure/sqlite_migration.gleam
-============================================================
+================================================================================
+
 import gleam/dynamic/decode
 import gleam/list
 import gleam/result
@@ -3220,9 +3294,10 @@ fn rollback_migration_adoption(db: sqlight.Connection) {
 }
 
 
-============================================================
+================================================================================
 FILE: src/infrastructure/sqlite_payment_repository.gleam
-============================================================
+================================================================================
+
 import application/ports/payment_repository
 import application/ports/repository_error
 import domain/parking_session
@@ -3594,9 +3669,10 @@ fn payment_status_to_string(status: payment.PaymentStatus) -> String {
 }
 
 
-============================================================
+================================================================================
 FILE: src/infrastructure/sqlite_session_repository.gleam
-============================================================
+================================================================================
+
 import application/ports/parking_session_repository
 import application/ports/repository_error
 import domain/parking_session
@@ -3924,26 +4000,404 @@ fn restore_session_state(
 }
 
 
-============================================================
+================================================================================
+FILE: src/interface/cli/app.gleam
+================================================================================
+
+import application/entry_parking
+import application/entry_parking_service
+import domain/parking_session
+import domain/parking_ticket
+import gleam/time/timestamp
+import interface/cli/display
+import interface/cli/input
+import interface/cli/menu
+import interface/cli/terminal_input
+import interface/cli/vehicle_input
+import youid/uuid
+
+/// Starts the interactive parking lot CLI.
+pub fn run(service: entry_parking_service.EntryParkingService) -> Nil {
+  display.heading("Parking Lot Management")
+  run_menu(service)
+}
+
+fn run_menu(service: entry_parking_service.EntryParkingService) -> Nil {
+  menu.display()
+
+  case terminal_input.read_line() {
+    Ok(raw_input) -> {
+      case input.parse_menu_action(raw_input) {
+        Ok(menu.VehicleEntry) -> {
+          handle_vehicle_entry(service)
+          run_menu(service)
+        }
+
+        Ok(menu.VehicleExit) -> {
+          display.warning("Vehicle exit flow is not implemented yet.")
+          run_menu(service)
+        }
+
+        Ok(menu.ViewParkingStatus) -> {
+          display.warning("Parking status view is not implemented yet.")
+          run_menu(service)
+        }
+
+        Ok(menu.Quit) -> display.success("Goodbye!")
+
+        Error(input.EmptyInput) -> {
+          display.warning("Input cannot be empty.")
+          run_menu(service)
+        }
+
+        Error(input.InvalidInput) -> {
+          display.warning("Invalid input.")
+          run_menu(service)
+        }
+
+        Error(input.UnknownOption) -> {
+          display.warning("Unknown menu option.")
+          run_menu(service)
+        }
+      }
+    }
+
+    Error(Nil) -> {
+      display.warning("Input stream closed. Exiting.")
+    }
+  }
+}
+
+fn handle_vehicle_entry(
+  service: entry_parking_service.EntryParkingService,
+) -> Nil {
+  case vehicle_input.read_vehicle() {
+    Ok(candidate_vehicle) -> {
+      let session_id_value = uuid.v7_string()
+      let ticket_id_value = uuid.v7_string()
+
+      case parking_session.new_parking_session_id(session_id_value) {
+        Ok(session_id) ->
+          case parking_ticket.new_parking_ticket_id(ticket_id_value) {
+            Ok(ticket_id) -> {
+              let #(entry_time, _) =
+                timestamp.system_time()
+                |> timestamp.to_unix_seconds_and_nanoseconds()
+
+              let request =
+                entry_parking.EntryParkingRequest(
+                  session_id: session_id,
+                  ticket_id: ticket_id,
+                  vehicle: candidate_vehicle,
+                  entry_time: entry_time,
+                )
+
+              case entry_parking_service.enter(service, request) {
+                Ok(_) ->
+                  display.success("Vehicle entry completed successfully.")
+
+                Error(error) ->
+                  display.error(entry_parking_service.error_message(error))
+              }
+            }
+
+            Error(_) -> display.error("Failed to generate parking ticket ID.")
+          }
+
+        Error(_) -> display.error("Failed to generate parking session ID.")
+      }
+    }
+
+    Error(Nil) ->
+      display.warning("Vehicle entry cancelled because input is unavailable.")
+  }
+}
+
+
+================================================================================
+FILE: src/interface/cli/display.gleam
+================================================================================
+
+import gleam/io
+
+/// Displays a section heading.
+pub fn heading(title: String) -> Nil {
+  io.println("")
+  io.println("================================")
+  io.println("  " <> title)
+  io.println("================================")
+}
+
+/// Displays an informational message.
+pub fn info(message: String) -> Nil {
+  io.println("[INFO] " <> message)
+}
+
+/// Displays a success message.
+pub fn success(message: String) -> Nil {
+  io.println("[SUCCESS] " <> message)
+}
+
+/// Displays an error message.
+pub fn error(message: String) -> Nil {
+  io.println("[ERROR] " <> message)
+}
+
+/// Displays a warning message.
+pub fn warning(message: String) -> Nil {
+  io.println("[WARNING] " <> message)
+}
+
+/// Displays a separator.
+pub fn separator() -> Nil {
+  io.println("--------------------------------")
+}
+
+/// Displays a prompt without a newline.
+pub fn prompt(message: String) -> Nil {
+  io.print(message)
+}
+
+
+================================================================================
+FILE: src/interface/cli/input.gleam
+================================================================================
+
+import gleam/string
+import interface/cli/menu
+
+/// Errors produced while parsing a menu selection.
+pub type MenuInputError {
+  EmptyInput
+  InvalidInput
+  UnknownOption
+}
+
+/// Converts raw user input into a menu action. 
+pub fn parse_menu_action(
+  input: String,
+) -> Result(menu.MenuAction, MenuInputError) {
+  case string.trim(input) {
+    "" -> Error(EmptyInput)
+    "1" -> Ok(menu.VehicleEntry)
+    "2" -> Ok(menu.VehicleExit)
+    "3" -> Ok(menu.ViewParkingStatus)
+    "0" -> Ok(menu.Quit)
+    _ -> Error(UnknownOption)
+  }
+}
+
+
+================================================================================
+FILE: src/interface/cli/menu.gleam
+================================================================================
+
+//// Defines the actions available in the parking lot CLI.
+
+import gleam/io
+
+pub type MenuAction {
+  VehicleEntry
+  VehicleExit
+  ViewParkingStatus
+  Quit
+}
+
+/// Displays the main menu.
+pub fn display() -> Nil {
+  io.println("")
+  io.println("================================")
+  io.println("          PARKING LOT")
+  io.println("================================")
+  io.println("1. Vehicle Entry")
+  io.println("2. Vehicle Exit")
+  io.println("3. View Parking Status")
+  io.println("0. Quit")
+  io.println("--------------------------------")
+  io.print("Select an option: ")
+}
+
+
+================================================================================
+FILE: src/interface/cli/terminal_input.gleam
+================================================================================
+
+//// Provides terminal input functionality for the CLI.
+////
+//// This module wraps the Erlang terminal input adapter.
+
+@external(erlang, "terminal_input", "read_line")
+fn read_line_ffi() -> Result(String, Nil)
+
+/// Reads one line from standard input.
+///
+/// Returns `Ok(input)` when a line is available.
+/// Returns `Error(Nil)` when the input stream reaches EOF or fails.
+pub fn read_line() -> Result(String, Nil) {
+  read_line_ffi()
+}
+
+
+================================================================================
+FILE: src/interface/cli/vehicle_input.gleam
+================================================================================
+
+import domain/vehicle
+import gleam/string
+import interface/cli/display
+import interface/cli/terminal_input
+import youid/uuid
+
+/// Errors produced while parsing a vehicle type selection.
+pub type VehicleTypeInputError {
+  EmptyInput
+  UnknownOption
+}
+
+/// Converts a numbered selection into a vehicle type.
+pub fn parse_vehicle_type(
+  raw_input: String,
+) -> Result(vehicle.VehicleType, VehicleTypeInputError) {
+  case string.trim(raw_input) {
+    "" -> Error(EmptyInput)
+    "1" -> Ok(vehicle.Motorcycle)
+    "2" -> Ok(vehicle.Car)
+    "3" -> Ok(vehicle.Truck)
+    _ -> Error(UnknownOption)
+  }
+}
+
+/// Collects vehicle information from the terminal.
+pub fn read_vehicle() -> Result(vehicle.Vehicle, Nil) {
+  display.heading("Vehicle Entry")
+
+  case read_plate_number() {
+    Ok(plate_number) ->
+      case read_vehicle_type() {
+        Ok(vehicle_type) -> create_vehicle(plate_number, vehicle_type)
+        Error(Nil) -> Error(Nil)
+      }
+
+    Error(Nil) -> Error(Nil)
+  }
+}
+
+fn read_plate_number() -> Result(vehicle.PlateNumber, Nil) {
+  display.prompt("Enter vehicle plate number: ")
+
+  case terminal_input.read_line() {
+    Ok(raw_input) ->
+      case vehicle.new_plate_number(raw_input) {
+        Ok(plate_number) -> Ok(plate_number)
+        Error(vehicle.EmptyPlateNumber) -> {
+          display.warning("Plate number cannot be empty.")
+          read_plate_number()
+        }
+        Error(vehicle.EmptyVehicleId) -> {
+          display.error("Unexpected vehicle ID validation error.")
+          Error(Nil)
+        }
+      }
+
+    Error(Nil) -> Error(Nil)
+  }
+}
+
+fn read_vehicle_type() -> Result(vehicle.VehicleType, Nil) {
+  display.separator()
+  display.info("Select vehicle type:")
+  display.info("1. Motorcycle")
+  display.info("2. Car")
+  display.info("3. Truck")
+  display.prompt("Select vehicle type: ")
+
+  case terminal_input.read_line() {
+    Ok(raw_input) ->
+      case parse_vehicle_type(raw_input) {
+        Ok(vehicle_type) -> Ok(vehicle_type)
+
+        Error(EmptyInput) -> {
+          display.warning("Vehicle type cannot be empty.")
+          read_vehicle_type()
+        }
+
+        Error(UnknownOption) -> {
+          display.warning("Unknown vehicle type. Please select 1, 2, or 3.")
+          read_vehicle_type()
+        }
+      }
+
+    Error(Nil) -> Error(Nil)
+  }
+}
+
+fn create_vehicle(
+  plate_number: vehicle.PlateNumber,
+  vehicle_type: vehicle.VehicleType,
+) -> Result(vehicle.Vehicle, Nil) {
+  let generated_id = uuid.v7_string()
+
+  case vehicle.new_vehicle_id(generated_id) {
+    Ok(vehicle_id) -> {
+      let new_vehicle =
+        vehicle.new_vehicle(vehicle_id, plate_number, vehicle_type)
+
+      display.success("Vehicle information accepted.")
+      Ok(new_vehicle)
+    }
+
+    Error(_) -> {
+      display.error("Failed to generate vehicle ID.")
+      Error(Nil)
+    }
+  }
+}
+
+
+================================================================================
+FILE: src/main.gleam
+================================================================================
+
+import parking_lot
+
+pub fn main() -> Nil {
+  parking_lot.main()
+}
+
+
+================================================================================
 FILE: src/parking_lot.gleam
-============================================================
+================================================================================
+
+import application/entry_parking_service
 import application/ports/repository_error
 import application/seed_parking_layout
 import domain/floor
 import domain/parking_slot
 import gleam/io
 import infrastructure/sqlite_database
+import infrastructure/sqlite_entry_parking_transaction
 import infrastructure/sqlite_floor_repository
+import interface/cli/app
 
 pub fn main() -> Nil {
   case sqlite_database.connect() {
     Ok(db) -> {
+      let entry_transaction =
+        sqlite_entry_parking_transaction.new(db)
+        |> sqlite_entry_parking_transaction.to_port
+
+      let entry_service = entry_parking_service.new(entry_transaction)
+
       let floor_repository =
         sqlite_floor_repository.new(db)
         |> sqlite_floor_repository.to_port
 
       case seed_parking_layout.seed(floor_repository) {
-        Ok(Nil) -> io.println("Parking layout seeded successfully")
+        Ok(Nil) -> {
+          io.println("Parking layout seeded successfully")
+          app.run(entry_service)
+        }
 
         Error(error) ->
           io.println(
@@ -3979,9 +4433,10 @@ fn seed_error_message(
 }
 
 
-============================================================
+================================================================================
 FILE: test/application/entry_parking_service_test.gleam
-============================================================
+================================================================================
+
 import application/entry_parking
 import application/entry_parking_service
 import application/ports/entry_parking_transaction
@@ -4187,9 +4642,10 @@ pub fn entry_fails_when_transaction_returns_domain_error_test() {
 }
 
 
-============================================================
+================================================================================
 FILE: test/application/exit_parking_test.gleam
-============================================================
+================================================================================
+
 import application/exit_parking
 import domain/parking_fee
 import domain/parking_session
@@ -4354,9 +4810,114 @@ pub fn failed_exit_does_not_mutate_original_session_test() {
 }
 
 
-============================================================
+================================================================================
+FILE: test/application/view_parking_status_test.gleam
+================================================================================
+
+import application/ports/parking_floor_repository
+import application/ports/parking_session_repository
+import application/ports/repository_error
+import application/view_parking_status
+import domain/floor
+import domain/parking_session
+import domain/parking_slot
+import domain/vehicle
+import gleeunit
+import gleeunit/should
+
+pub fn main() {
+  gleeunit.main()
+}
+
+fn sample_floor_test() -> floor.ParkingFloor {
+  let floor_id = floor.new_parking_floor_id()
+  floor.new_parking_floor(floor_id)
+}
+
+fn sample_session_test() -> parking_session.ParkingSession {
+  let session_id = parking_session.new_parking_session_id()
+  let vehicle_id = vehicle.new_vehicle_id()
+  let slot_id = parking_slot.new_parking_slot_id()
+
+  parking_session.new_parking_session(session_id, vehicle_id, slot_id, 1)
+}
+
+pub fn view_returns_parking_status_when_both_repositories_succeed_test() {
+  let expected_floors = [sample_floor_test()]
+  let expected_sessions = [sample_session_test()]
+
+  let floor_repository =
+    parking_floor_repository.ParkingFloorRepository(get_all_floors: fn() {
+      Ok(expected_floors)
+    })
+
+  let session_repository =
+    parking_session_repository.ParkingSessionRepository(
+      get_active_sessions: fn() { Ok(expected_sessions) },
+    )
+
+  let result = view_parking_status.view(floor_repository, session_repository)
+
+  result
+  |> should.equal(
+    Ok(view_parking_status.ParkingStatus(
+      floors: expected_floors,
+      active_sessions: expected_sessions,
+    )),
+  )
+}
+
+pub fn view_returns_floor_repository_error_when_loading_floors_fails_test() {
+  let empty_sessions: List(parking_session.ParkingSession) = []
+
+  let floor_repository =
+    parking_floor_repository.ParkingFloorRepository(get_all_floors: fn() {
+      Error(repository_error.DatabaseError)
+    })
+
+  let session_repository =
+    parking_session_repository.ParkingSessionRepository(
+      get_active_sessions: fn() { Ok(empty_sessions) },
+    )
+
+  let result = view_parking_status.view(floor_repository, session_repository)
+
+  result
+  |> should.equal(
+    Error(view_parking_status.FloorRepositoryFailed(
+      repository_error.DatabaseError,
+    )),
+  )
+}
+
+pub fn view_returns_session_repository_error_when_loading_sessions_fails_test() {
+  let expected_floors = [sample_floor_test()]
+
+  let floor_repository =
+    parking_floor_repository.ParkingFloorRepository(get_all_floors: fn() {
+      Ok(expected_floors)
+    })
+
+  let session_repository =
+    parking_session_repository.ParkingSessionRepository(
+      get_active_sessions: fn() { Error(repository_error.DatabaseError) },
+    )
+
+  let result = view_parking_status.view(floor_repository, session_repository)
+
+  result
+  |> should.equal(
+    Error(view_parking_status.SessionRepositoryFailed(
+      repository_error.DatabaseError,
+    )),
+  )
+}
+
+
+================================================================================
 FILE: test/domain/floor_test.gleam
-============================================================
+================================================================================
+
 import domain/floor
 import domain/parking_slot
 import domain/vehicle
@@ -4468,9 +5029,10 @@ pub fn successful_add_does_not_change_original_floor_test() {
 }
 
 
-============================================================
+================================================================================
 FILE: test/domain/parking_allocation_test.gleam
-============================================================
+================================================================================
+
 import domain/parking_allocation
 import domain/parking_session
 import domain/parking_slot
@@ -4693,9 +5255,10 @@ pub fn slot_can_be_reused_after_previous_session_is_closed_test() {
 }
 
 
-============================================================
+================================================================================
 FILE: test/domain/parking_fee_test.gleam
-============================================================
+================================================================================
+
 import domain/parking_fee
 import gleeunit/should
 
@@ -4777,9 +5340,10 @@ pub fn parking_fee_calculates_large_duration_test() {
 }
 
 
-============================================================
+================================================================================
 FILE: test/domain/parking_pricing_policy_test.gleam
-============================================================
+================================================================================
+
 import domain/parking_pricing_policy
 import domain/vehicle
 import gleeunit/should
@@ -4894,9 +5458,10 @@ pub fn get_hourly_rate_returns_truck_rate_test() {
 }
 
 
-============================================================
+================================================================================
 FILE: test/domain/parking_session_test.gleam
-============================================================
+================================================================================
+
 import domain/parking_session
 import domain/parking_slot
 import domain/vehicle
@@ -5098,9 +5663,10 @@ pub fn exit_time_equal_to_entry_time_is_accepted_test() {
 }
 
 
-============================================================
+================================================================================
 FILE: test/domain/parking_slot_test.gleam
-============================================================
+================================================================================
+
 import domain/parking_slot
 import domain/vehicle
 import gleeunit/should
@@ -5168,9 +5734,10 @@ pub fn parking_slot_checks_vehicle_compatibility_test() {
 }
 
 
-============================================================
+================================================================================
 FILE: test/domain/parking_ticket_test.gleam
-============================================================
+================================================================================
+
 import domain/parking_session
 import domain/parking_ticket
 import gleeunit/should
@@ -5236,9 +5803,10 @@ pub fn new_parking_ticket_stores_issued_at_test() {
 }
 
 
-============================================================
+================================================================================
 FILE: test/domain/payment_test.gleam
-============================================================
+================================================================================
+
 import domain/parking_session
 import domain/payment
 import gleeunit/should
@@ -5460,9 +6028,10 @@ pub fn original_payment_remains_pending_after_success_test() {
 }
 
 
-============================================================
+================================================================================
 FILE: test/domain/vehicle_test.gleam
-============================================================
+================================================================================
+
 import domain/vehicle
 import gleeunit/should
 
@@ -5535,9 +6104,10 @@ pub fn vehicle_stores_its_attributes_test() {
 }
 
 
-============================================================
+================================================================================
 FILE: test/infrastructure/entry_parking_test.gleam
-============================================================
+================================================================================
+
 import application/entry_parking
 import domain/floor
 import domain/parking_allocation
@@ -5825,9 +6395,10 @@ pub fn entry_fails_when_entry_time_is_negative_test() {
 }
 
 
-============================================================
+================================================================================
 FILE: test/infrastructure/seed_parking_layout_test.gleam
-============================================================
+================================================================================
+
 import application/seed_parking_layout
 import domain/floor
 import gleam/dynamic/decode
@@ -5946,9 +6517,292 @@ pub fn seed_parking_layout_can_be_loaded_as_domain_aggregates_test() {
 }
 
 
-============================================================
+================================================================================
+FILE: test/infrastructure/sqlite/sqlite_connection_test.gleam
+================================================================================
+
+import gleeunit/should
+import infrastructure/sqlite_connection as connection
+import sqlight
+
+pub fn connect_opens_database_test() {
+  let assert Ok(db) = connection.connect()
+
+  let assert Ok(_) = sqlight.exec("SELECT 1;", on: db)
+
+  let assert Ok(Nil) = sqlight.close(db)
+
+  should.be_ok(Ok(Nil))
+}
+
+pub fn foreign_keys_are_enabled_test() {
+  let assert Ok(db) = connection.connect()
+
+  let assert Ok(_) =
+    sqlight.exec(
+      "CREATE TABLE IF NOT EXISTS connection_test_parent (
+        id INTEGER PRIMARY KEY
+      );",
+      on: db,
+    )
+
+  let assert Ok(_) =
+    sqlight.exec(
+      "CREATE TABLE IF NOT EXISTS connection_test_child (
+        parent_id INTEGER NOT NULL,
+        FOREIGN KEY (parent_id)
+          REFERENCES connection_test_parent(id)
+      );",
+      on: db,
+    )
+
+  let result =
+    sqlight.exec(
+      "INSERT INTO connection_test_child (parent_id) VALUES (999999);",
+      on: db,
+    )
+
+  let assert Error(_) = result
+
+  let assert Ok(Nil) = sqlight.exec("DROP TABLE connection_test_child;", on: db)
+
+  let assert Ok(Nil) =
+    sqlight.exec("DROP TABLE connection_test_parent;", on: db)
+
+  let assert Ok(Nil) = sqlight.close(db)
+}
+
+
+================================================================================
+FILE: test/infrastructure/sqlite/sqlite_migration_test.gleam
+================================================================================
+
+import gleam/dynamic/decode
+import gleam/list
+import gleeunit/should
+import infrastructure/sqlite_connection as connection
+import infrastructure/sqlite_migration as migration
+import simplifile
+import sqlight
+
+const migrations_dir = "priv/repo/migrations"
+
+const initial_migration_name = "001_create_parking_schema"
+
+fn table_exists(db: sqlight.Connection, table_name: String) -> Bool {
+  let assert Ok(rows) =
+    sqlight.query(
+      "
+      SELECT name
+      FROM sqlite_master
+      WHERE type = 'table'
+        AND name = ?;
+      ",
+      on: db,
+      with: [sqlight.text(table_name)],
+      expecting: decode.at([0], decode.string),
+    )
+
+  list.contains(rows, table_name)
+}
+
+fn migration_is_recorded(db: sqlight.Connection) -> Bool {
+  let assert Ok(names) =
+    sqlight.query(
+      "
+      SELECT name
+      FROM __migrations
+      WHERE name = ?;
+      ",
+      on: db,
+      with: [sqlight.text(initial_migration_name)],
+      expecting: decode.at([0], decode.string),
+    )
+
+  list.contains(names, initial_migration_name)
+}
+
+// MARK: New Database
+
+pub fn migrate_creates_schema_for_new_database_test() {
+  let assert Ok(db) = connection.connect_to(":memory:")
+
+  let assert Ok(Nil) = migration.migrate(db, migrations_dir)
+
+  table_exists(db, "parking_floors")
+  |> should.be_true
+
+  table_exists(db, "parking_slots")
+  |> should.be_true
+
+  table_exists(db, "vehicles")
+  |> should.be_true
+
+  table_exists(db, "parking_sessions")
+  |> should.be_true
+
+  table_exists(db, "parking_tickets")
+  |> should.be_true
+
+  table_exists(db, "__migrations")
+  |> should.be_true
+
+  migration_is_recorded(db)
+  |> should.be_true
+
+  let assert Ok(Nil) = sqlight.close(db)
+}
+
+// MARK: Legacy Database Adoption
+
+pub fn migrate_adopts_existing_legacy_schema_test() {
+  let assert Ok(db) = connection.connect_to(":memory:")
+
+  let assert Ok(schema_sql) =
+    simplifile.read("priv/repo/migrations/001_create_parking_schema.up.sql")
+
+  let assert Ok(Nil) = sqlight.exec(schema_sql, on: db)
+
+  let assert Ok(Nil) =
+    sqlight.exec(
+      "
+      CREATE TABLE schema_migrations (
+        version INTEGER PRIMARY KEY NOT NULL,
+        name TEXT NOT NULL,
+        applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+      );
+
+      INSERT INTO schema_migrations (version, name)
+      VALUES (1, '001_create_parking_schema.sql');
+      ",
+      on: db,
+    )
+
+  let assert Ok(Nil) = migration.migrate(db, migrations_dir)
+  let assert Ok(Nil) = migration.migrate(db, migrations_dir)
+
+  table_exists(db, "parking_floors")
+  |> should.be_true
+
+  table_exists(db, "parking_slots")
+  |> should.be_true
+
+  table_exists(db, "vehicles")
+  |> should.be_true
+
+  table_exists(db, "parking_sessions")
+  |> should.be_true
+
+  table_exists(db, "parking_tickets")
+  |> should.be_true
+
+  migration_is_recorded(db)
+  |> should.be_true
+
+  let assert Ok(names) =
+    sqlight.query(
+      "
+      SELECT name
+      FROM __migrations
+      WHERE name = ?;
+      ",
+      on: db,
+      with: [sqlight.text(initial_migration_name)],
+      expecting: decode.at([0], decode.string),
+    )
+
+  list.length(names)
+  |> should.equal(1)
+
+  let assert Ok(Nil) = sqlight.close(db)
+}
+
+// MARK: Partial Schema
+
+pub fn migrate_rejects_partial_schema_test() {
+  let assert Ok(db) = connection.connect_to(":memory:")
+
+  let assert Ok(Nil) =
+    sqlight.exec(
+      "
+      CREATE TABLE parking_floors (
+        id TEXT PRIMARY KEY NOT NULL
+      );
+      ",
+      on: db,
+    )
+
+  let assert Error(_) = migration.migrate(db, migrations_dir)
+
+  table_exists(db, "parking_floors")
+  |> should.be_true
+
+  table_exists(db, "parking_slots")
+  |> should.be_false
+
+  let assert Ok(Nil) = sqlight.close(db)
+}
+
+// MARK: Idempotency
+
+pub fn migrate_does_not_apply_existing_migration_twice_test() {
+  let assert Ok(db) = connection.connect_to(":memory:")
+
+  let assert Ok(Nil) = migration.migrate(db, migrations_dir)
+  let assert Ok(Nil) = migration.migrate(db, migrations_dir)
+
+  let assert Ok(names) =
+    sqlight.query(
+      "
+      SELECT name
+      FROM __migrations
+      WHERE name = ?;
+      ",
+      on: db,
+      with: [sqlight.text(initial_migration_name)],
+      expecting: decode.at([0], decode.string),
+    )
+
+  list.length(names)
+  |> should.equal(1)
+
+  let assert Ok(Nil) = sqlight.close(db)
+}
+
+pub fn migrate_rejects_migration_history_without_domain_schema_test() {
+  let assert Ok(db) = connection.connect_to(":memory:")
+
+  let assert Ok(Nil) =
+    sqlight.exec(
+      "
+      CREATE TABLE __migrations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      );
+
+      INSERT INTO __migrations (name)
+      VALUES ('001_create_parking_schema');
+      ",
+      on: db,
+    )
+
+  let assert Error(_) = migration.migrate(db, migrations_dir)
+
+  table_exists(db, "parking_floors")
+  |> should.be_false
+
+  table_exists(db, "parking_slots")
+  |> should.be_false
+
+  let assert Ok(Nil) = sqlight.close(db)
+}
+
+
+================================================================================
 FILE: test/infrastructure/sqlite_entry_parking_transaction_test.gleam
-============================================================
+================================================================================
+
 import application/entry_parking
 import application/ports/entry_parking_transaction
 import application/ports/repository_error
@@ -6316,9 +7170,10 @@ pub fn failed_ticket_insert_rolls_back_vehicle_and_session_test() {
 }
 
 
-============================================================
+================================================================================
 FILE: test/infrastructure/sqlite_exit_parking_transaction_test.gleam
-============================================================
+================================================================================
+
 import application/exit_parking
 import application/ports/exit_parking_transaction
 import application/ports/repository_error
@@ -6668,9 +7523,10 @@ pub fn failed_session_update_rolls_back_payment_test() {
 }
 
 
-============================================================
+================================================================================
 FILE: test/infrastructure/sqlite_floor_repository_test.gleam
-============================================================
+================================================================================
+
 import domain/floor
 import domain/parking_slot
 import domain/vehicle
@@ -6798,9 +7654,10 @@ pub fn get_all_floors_with_slots_test() {
 }
 
 
-============================================================
+================================================================================
 FILE: test/infrastructure/sqlite_session_repository_test.gleam
-============================================================
+================================================================================
+
 import domain/parking_session
 import domain/parking_slot
 import domain/vehicle
@@ -6934,291 +7791,14 @@ pub fn get_active_sessions_maps_domain_fields_test() {
 }
 
 
-============================================================
-FILE: test/infrastructure/sqlite/sqlite_connection_test.gleam
-============================================================
-import gleeunit/should
-import infrastructure/sqlite_connection as connection
-import sqlight
-
-pub fn connect_opens_database_test() {
-  let assert Ok(db) = connection.connect()
-
-  let assert Ok(_) = sqlight.exec("SELECT 1;", on: db)
-
-  let assert Ok(Nil) = sqlight.close(db)
-
-  should.be_ok(Ok(Nil))
-}
-
-pub fn foreign_keys_are_enabled_test() {
-  let assert Ok(db) = connection.connect()
-
-  let assert Ok(_) =
-    sqlight.exec(
-      "CREATE TABLE IF NOT EXISTS connection_test_parent (
-        id INTEGER PRIMARY KEY
-      );",
-      on: db,
-    )
-
-  let assert Ok(_) =
-    sqlight.exec(
-      "CREATE TABLE IF NOT EXISTS connection_test_child (
-        parent_id INTEGER NOT NULL,
-        FOREIGN KEY (parent_id)
-          REFERENCES connection_test_parent(id)
-      );",
-      on: db,
-    )
-
-  let result =
-    sqlight.exec(
-      "INSERT INTO connection_test_child (parent_id) VALUES (999999);",
-      on: db,
-    )
-
-  let assert Error(_) = result
-
-  let assert Ok(Nil) = sqlight.exec("DROP TABLE connection_test_child;", on: db)
-
-  let assert Ok(Nil) =
-    sqlight.exec("DROP TABLE connection_test_parent;", on: db)
-
-  let assert Ok(Nil) = sqlight.close(db)
-}
-
-
-============================================================
-FILE: test/infrastructure/sqlite/sqlite_migration_test.gleam
-============================================================
-import gleam/dynamic/decode
-import gleam/list
-import gleeunit/should
-import infrastructure/sqlite_connection as connection
-import infrastructure/sqlite_migration as migration
-import simplifile
-import sqlight
-
-const migrations_dir = "priv/repo/migrations"
-
-const initial_migration_name = "001_create_parking_schema"
-
-fn table_exists(db: sqlight.Connection, table_name: String) -> Bool {
-  let assert Ok(rows) =
-    sqlight.query(
-      "
-      SELECT name
-      FROM sqlite_master
-      WHERE type = 'table'
-        AND name = ?;
-      ",
-      on: db,
-      with: [sqlight.text(table_name)],
-      expecting: decode.at([0], decode.string),
-    )
-
-  list.contains(rows, table_name)
-}
-
-fn migration_is_recorded(db: sqlight.Connection) -> Bool {
-  let assert Ok(names) =
-    sqlight.query(
-      "
-      SELECT name
-      FROM __migrations
-      WHERE name = ?;
-      ",
-      on: db,
-      with: [sqlight.text(initial_migration_name)],
-      expecting: decode.at([0], decode.string),
-    )
-
-  list.contains(names, initial_migration_name)
-}
-
-// MARK: New Database
-
-pub fn migrate_creates_schema_for_new_database_test() {
-  let assert Ok(db) = connection.connect_to(":memory:")
-
-  let assert Ok(Nil) = migration.migrate(db, migrations_dir)
-
-  table_exists(db, "parking_floors")
-  |> should.be_true
-
-  table_exists(db, "parking_slots")
-  |> should.be_true
-
-  table_exists(db, "vehicles")
-  |> should.be_true
-
-  table_exists(db, "parking_sessions")
-  |> should.be_true
-
-  table_exists(db, "parking_tickets")
-  |> should.be_true
-
-  table_exists(db, "__migrations")
-  |> should.be_true
-
-  migration_is_recorded(db)
-  |> should.be_true
-
-  let assert Ok(Nil) = sqlight.close(db)
-}
-
-// MARK: Legacy Database Adoption
-
-pub fn migrate_adopts_existing_legacy_schema_test() {
-  let assert Ok(db) = connection.connect_to(":memory:")
-
-  let assert Ok(schema_sql) =
-    simplifile.read("priv/repo/migrations/001_create_parking_schema.up.sql")
-
-  let assert Ok(Nil) = sqlight.exec(schema_sql, on: db)
-
-  let assert Ok(Nil) =
-    sqlight.exec(
-      "
-      CREATE TABLE schema_migrations (
-        version INTEGER PRIMARY KEY NOT NULL,
-        name TEXT NOT NULL,
-        applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-      );
-
-      INSERT INTO schema_migrations (version, name)
-      VALUES (1, '001_create_parking_schema.sql');
-      ",
-      on: db,
-    )
-
-  let assert Ok(Nil) = migration.migrate(db, migrations_dir)
-  let assert Ok(Nil) = migration.migrate(db, migrations_dir)
-
-  table_exists(db, "parking_floors")
-  |> should.be_true
-
-  table_exists(db, "parking_slots")
-  |> should.be_true
-
-  table_exists(db, "vehicles")
-  |> should.be_true
-
-  table_exists(db, "parking_sessions")
-  |> should.be_true
-
-  table_exists(db, "parking_tickets")
-  |> should.be_true
-
-  migration_is_recorded(db)
-  |> should.be_true
-
-  let assert Ok(names) =
-    sqlight.query(
-      "
-      SELECT name
-      FROM __migrations
-      WHERE name = ?;
-      ",
-      on: db,
-      with: [sqlight.text(initial_migration_name)],
-      expecting: decode.at([0], decode.string),
-    )
-
-  list.length(names)
-  |> should.equal(1)
-
-  let assert Ok(Nil) = sqlight.close(db)
-}
-
-// MARK: Partial Schema
-
-pub fn migrate_rejects_partial_schema_test() {
-  let assert Ok(db) = connection.connect_to(":memory:")
-
-  let assert Ok(Nil) =
-    sqlight.exec(
-      "
-      CREATE TABLE parking_floors (
-        id TEXT PRIMARY KEY NOT NULL
-      );
-      ",
-      on: db,
-    )
-
-  let assert Error(_) = migration.migrate(db, migrations_dir)
-
-  table_exists(db, "parking_floors")
-  |> should.be_true
-
-  table_exists(db, "parking_slots")
-  |> should.be_false
-
-  let assert Ok(Nil) = sqlight.close(db)
-}
-
-// MARK: Idempotency
-
-pub fn migrate_does_not_apply_existing_migration_twice_test() {
-  let assert Ok(db) = connection.connect_to(":memory:")
-
-  let assert Ok(Nil) = migration.migrate(db, migrations_dir)
-  let assert Ok(Nil) = migration.migrate(db, migrations_dir)
-
-  let assert Ok(names) =
-    sqlight.query(
-      "
-      SELECT name
-      FROM __migrations
-      WHERE name = ?;
-      ",
-      on: db,
-      with: [sqlight.text(initial_migration_name)],
-      expecting: decode.at([0], decode.string),
-    )
-
-  list.length(names)
-  |> should.equal(1)
-
-  let assert Ok(Nil) = sqlight.close(db)
-}
-
-pub fn migrate_rejects_migration_history_without_domain_schema_test() {
-  let assert Ok(db) = connection.connect_to(":memory:")
-
-  let assert Ok(Nil) =
-    sqlight.exec(
-      "
-      CREATE TABLE __migrations (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT NOT NULL,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-      );
-
-      INSERT INTO __migrations (name)
-      VALUES ('001_create_parking_schema');
-      ",
-      on: db,
-    )
-
-  let assert Error(_) = migration.migrate(db, migrations_dir)
-
-  table_exists(db, "parking_floors")
-  |> should.be_false
-
-  table_exists(db, "parking_slots")
-  |> should.be_false
-
-  let assert Ok(Nil) = sqlight.close(db)
-}
-
-
-============================================================
+================================================================================
 FILE: test/parking_lot_test.gleam
-============================================================
+================================================================================
+
 import gleeunit
 
 pub fn main() {
   gleeunit.main()
 }
+
+
